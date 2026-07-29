@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-- 状态：实施中；Phase 0～Phase 3 已通过，Phase 4 待开始
+- 状态：实施中；Phase 0～Phase 4 已通过，Phase 5 待开始
 - 对应需求：[OPENAI_DEVICE_CODE_LOGIN_REQUIREMENTS.md](OPENAI_DEVICE_CODE_LOGIN_REQUIREMENTS.md)
 - 适用仓库：个人 Fork `yangyunzhao/OpenMinis`
 - 官方上游：`OpenMinis/OpenMinis`
@@ -60,7 +60,7 @@
 | Phase 1 | 安全与凭据清理基础 | 日志脱敏、错误收口、删除 OpenAI OAuth Provider 完整清理 | JVM 单元测试、现有 OAuth 回归 | 已通过：18 项 focused tests 全绿；完整测试仍为 39 个基线失败 |
 | Phase 2 | OpenAI 设备授权协议核心 | 独立协议模型、HTTP 客户端、轮询分类与 Token 交换 | MockWebServer 和纯逻辑测试 | 已通过：16 项 focused tests 全绿；完整测试仍为 39 个基线失败 |
 | Phase 3 | 登录状态、并发与生命周期 | 状态机、取消、超时、重试、迟到结果保护 | 协程虚拟时间和并发测试 | 已通过：24 项协调器测试全绿；完整测试仍为 39 个基线失败 |
-| Phase 4 | 新增 Provider UI 与持久化集成 | 双登录入口、设备码界面、Custom Tab、凭据和模型集成 | JVM 测试、编译、静态审查 | 未开始 |
+| Phase 4 | 新增 Provider UI 与持久化集成 | 双登录入口、设备码界面、Custom Tab、凭据和模型集成 | JVM 测试、编译、静态审查 | 已通过：78 项安全/兼容 focused tests 全绿；完整 460 项测试仍为相同 39 个基线失败；最终独立审查无 blocker/high |
 | Phase 5 | 自动化回归与 Debug 构建 | 完整 JVM 回归结果、Debug APK | `testDebugUnitTest`、`assembleDebug` | 未开始 |
 | Phase 6 | 用户真机验收与缺陷闭环 | 真机检查表、用户结果、必要修复 | 用户真实设备验收 | 未开始 |
 | Phase 7 | 交付、推送与持续维护 | 最终文档、个人远端分支、APK/源码对应关系 | Git、安全、许可证和维护检查 | 未开始 |

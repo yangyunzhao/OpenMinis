@@ -67,6 +67,16 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
         internal fun credentialPreferenceKeys(instanceId: String): Set<String> =
             OAuthManager.credentialPreferenceKeys(instanceId, OPENAI_CREDENTIAL_KEY_NAMES)
 
+        /** 设备提交/补偿必须覆盖的完整逻辑 key 集；纯函数供 JVM 回归测试。 */
+        internal fun deviceSnapshotKeyNames(): Set<String> = setOf(
+            "tokens",
+            "manual_bearer_token",
+            "verifier",
+            "state",
+            "account_id",
+            "plan_type",
+        )
+
         /**
          * Validate the status without accepting the response body. Keeping the
          * body out of this API makes it impossible for the thrown exception to
@@ -90,6 +100,30 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
             } catch (_: Exception) {
                 throw OAuthTokenResponseException()
             }
+
+        internal data class IdTokenClaims(
+            val accountId: String?,
+            val planType: String?,
+        )
+
+        /**
+         * 只提取 Codex 请求所需的两个辅助字段。解析失败返回空 claims，不保留或记录
+         * JWT 正文；ID Token 的密码学验证仍不属于本地客户端职责。
+         */
+        internal fun parseIdTokenClaims(token: String): IdTokenClaims {
+            return try {
+                val parts = token.split(".")
+                if (parts.size < 2) return IdTokenClaims(null, null)
+                val payload = String(java.util.Base64.getUrlDecoder().decode(parts[1]))
+                val json = JSONObject(payload)
+                IdTokenClaims(
+                    accountId = json.optString("chatgpt_account_id").ifEmpty { null },
+                    planType = json.optString("chatgpt_plan_type").ifEmpty { null },
+                )
+            } catch (_: Exception) {
+                IdTokenClaims(null, null)
+            }
+        }
 
         /**
          * Static helper: perform full login flow and save the access token.
@@ -212,6 +246,46 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
             parseIdToken(idToken)
         }
     }
+
+    /**
+     * 同步提交设备授权 Token 与 account/plan 辅助字段。
+     *
+     * 同一个 oauth_prefs editor 会先清除可能冲突的浏览器 PKCE、manual bearer 和旧
+     * account metadata，再写白名单 Token JSON。返回 false 时调用方必须补偿清理。
+     */
+    fun commitDeviceTokens(tokens: OpenAIDeviceTokens): Boolean {
+        val claims = parseIdTokenClaims(tokens.idToken)
+        val values = mutableMapOf(
+            "tokens" to tokens.toOAuthStorageJson(),
+        )
+        claims.accountId?.let { values["account_id"] = it }
+        claims.planType?.let { values["plan_type"] = it }
+        return commitOAuthSnapshot(
+            values = values,
+            removeKeyNames = deviceSnapshotKeyNames(),
+        )
+    }
+
+    /** 同步清除完整 OpenAI 凭据；用于提交补偿与启动恢复。 */
+    fun clearDeviceCredentialsStrict(): Boolean =
+        commitOAuthSnapshot(
+            values = emptyMap(),
+            removeKeyNames = deviceSnapshotKeyNames(),
+        )
+
+    /**
+     * 启动恢复只需要完整性判断，不向 Repository 暴露 Token。API mirror 必须由
+     * Repository 单独比较 access_token。
+     */
+    fun hasCompleteDeviceTokens(): Boolean {
+        val json = loadStoredTokens() ?: return false
+        return listOf("access_token", "refresh_token", "id_token").all { key ->
+            json.optString(key, "").isNotBlank()
+        }
+    }
+
+    fun storedAccessTokenMatches(expected: String): Boolean =
+        loadStoredTokens()?.optString("access_token", "") == expected
 
     /**
      * Exchange authorization code for tokens using JSON body.
@@ -380,16 +454,8 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
     }
 
     private fun parseIdToken(token: String) {
-        try {
-            val parts = token.split(".")
-            if (parts.size >= 2) {
-                val payload = String(java.util.Base64.getUrlDecoder().decode(parts[1]))
-                val json = JSONObject(payload)
-                accountId = json.optString("chatgpt_account_id").ifEmpty { null }
-                planType = json.optString("chatgpt_plan_type").ifEmpty { null }
-            }
-        } catch (e: Exception) {
-            AppLogger.warning(TAG, "id_token parse failed: ${e.javaClass.simpleName}: ${e.message}")
-        }
+        val claims = parseIdTokenClaims(token)
+        accountId = claims.accountId
+        planType = claims.planType
     }
 }

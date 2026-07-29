@@ -410,6 +410,26 @@ abstract class OAuthManager(
     }
 
     /**
+     * 设备码 Provider 一致性提交使用的同步写入边界。
+     *
+     * 普通 OAuth 流程继续使用既有 apply() 行为；只有需要确认落盘结果的设备码提交
+     * 才调用这里。所有 key 都会自动限定到当前 instance ID。
+     */
+    protected fun commitOAuthSnapshot(
+        values: Map<String, String>,
+        removeKeyNames: Set<String> = emptySet(),
+    ): Boolean {
+        val editor = getEncryptedPrefs().edit()
+        removeKeyNames.forEach { key ->
+            editor.remove("oauth_${key}_$instanceId")
+        }
+        values.forEach { (key, value) ->
+            editor.putString("oauth_${key}_$instanceId", value)
+        }
+        return editor.commit()
+    }
+
+    /**
      * User-provided static bearer token used in place of the dynamic OAuth
      * access token. Mirrors iOS `"manual-oauth-token"` keychain account.
      * When set, [validAccessToken] returns it verbatim and no refresh is

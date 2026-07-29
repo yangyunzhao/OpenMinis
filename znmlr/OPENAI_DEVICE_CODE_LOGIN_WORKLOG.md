@@ -36,10 +36,13 @@
 | 2026-07-30 03:06 | Phase 2 | 已通过 | 单次用户码、轮询、Token 表单交换、可取消 HTTP 和敏感结果模型完成；16 项 focused tests 全绿；完整 421 项测试仍为相同 39 个基线失败。 |
 | 2026-07-30 03:08 | Phase 3 | 进行中 | 开始实现路由级状态持有者、15 分钟虚拟超时、有限重试、generation 竞态防护和内存 Token 移交。 |
 | 2026-07-30 03:34 | Phase 3 | 已通过 | 状态机、ViewModel、超时/退避、迟到结果防护、响应时固化过期时间和一次性提交租约完成；40 项 Phase 2+3 focused tests 全绿；完整 445 项测试仍为相同 39 个基线失败。 |
+| 2026-07-30 03:36 | Phase 4 | 进行中 | 开始接入新增 OpenAI Provider 页面、专用设备码对话框、路由级 ViewModel、严格跨存储提交、补偿和启动恢复。 |
+| 2026-07-30 05:03 | Phase 4 | 已通过 | 双登录入口、Custom Tab、复制反馈、三路径互斥、严格凭据提交、崩溃恢复、模型失败重试和统一配置写锁完成；78 项安全/兼容 focused tests 全绿；完整 460 项测试仍为相同 39 个基线失败；最终独立审查无 blocker/high。 |
 
 ## 4. 当前阻塞项
 
-Phase 0 的工具链与基线阻塞已解除。当前没有阻止 Phase 1 本地实现的事项。
+Phase 0 的工具链与基线阻塞已解除。Phase 4 已通过，当前没有阻止 Phase 5
+本地自动化和 Debug 构建的事项。
 Phase 6 的真实账号、真机生命周期和真实模型请求仍需用户参与，不能由本地验证替代。
 
 阻塞项的完整证据见
@@ -67,6 +70,10 @@ Phase 6 的真实账号、真机生命周期和真实模型请求仍需用户参
 | NB-16 | 2026-07-30 | Phase 3 尚未增加真实多线程同时 claim 与 cancel/close 的压力测试。 | 所有共享状态均由同一锁保护，顺序化的领取优先和取消优先都安全；Phase 4 仍须逐阶段复核租约并补偿失败。 |
 | NB-17 | 2026-07-30 | 尚未直接单元测试 Android ViewModel 的 `onCleared()`。 | 协调器 `close()` 已有 JVM 测试；真实路由销毁和 Activity 生命周期留 Phase 6 真机验证。 |
 | NB-18 | 2026-07-30 | 协程 15 分钟 timeout 在真实设备深度睡眠和厂商后台限制下的实际 wall-clock 体验不能由 JVM 虚拟时间证明。 | Phase 3 只声明逻辑级通过；Phase 6 用真机后台、锁屏和恢复场景验收。 |
+| NB-19 | 2026-07-30 | 一次设置了过短外部超时的 Gradle 命令在调用方超时后仍于 WSL 内继续运行；随后若再次启动 Gradle，会并发写 KSP 输出并造成 `FileAlreadyExistsException`。 | 已识别并只结束该次残留进程，隔离忽略目录中的损坏 KSP 输出后冷构建成功。后续长命令使用可恢复的后台 cell 等待，不再用短 shell 超时判断 Gradle 是否结束。 |
+| NB-20 | 2026-07-30 | pending marker 按已确认要求只能保存 instance ID 和阶段名。若应用内部 marker 文件被异常篡改并恰好指向另一条同形官方 OpenAI OAuth Provider，仅凭这两个字段无法证明来源。 | marker 文件作为应用内部可信日志；类型不符只清 marker，单笔恢复异常隐藏目标且保留 marker。Phase 6 只对本功能新建的测试 Provider 做强杀/恢复检查，不人为篡改真实用户配置。 |
+| NB-21 | 2026-07-30 | Android `ProviderRepository` 的真实 Room、EncryptedSharedPreferences、Keystore 和进程强杀恢复无法在当前纯 JVM 环境直接实例化。 | 纯决策表和提交器逐阶段中断测试已通过，生产适配器经编译和独立审查；真实进程中断、重启与 Keystore 行为留 Phase 6 真机。 |
+| NB-22 | 2026-07-30 | OpenAI 基础 OAuth 刷新目前缺少单飞保护；并发刷新旋转型 refresh token 时理论上可能让后一个失败调用清除前一个刚写入的 Token。 | 不阻塞 Phase 4。Phase 5 先完成模拟过期 Token 的既有刷新路径回归，并记录/评估是否在不扩大 Provider 行为的前提下增加单飞或 compare-before-delete。 |
 
 ## 6. 待用户回来后确认
 
