@@ -12,6 +12,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -25,6 +26,28 @@ abstract class OAuthManager(
     companion object {
         private const val TAG = "OAuthManager"
         private const val KEY_MANUAL_BEARER = "manual_bearer_token"
+        private val SENSITIVE_BODY_FIELDS = setOf(
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "api_key",
+            "key",
+            "client_secret",
+            "device_code",
+            "user_code",
+            "device_auth_id",
+            "authorization_code",
+            "code_verifier",
+            "code_challenge",
+        )
+        private val SENSITIVE_BODY_KEY_PATTERN = Regex(
+            "\"(?:${SENSITIVE_BODY_FIELDS.joinToString("|")})\"\\s*:",
+            RegexOption.IGNORE_CASE,
+        )
+        private val SENSITIVE_FORM_FIELD_PATTERN = Regex(
+            "(^|[&?\\s])(${SENSITIVE_BODY_FIELDS.joinToString("|")})=([^&\\s]*)",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE),
+        )
 
         /** Shared OkHttp client for all OAuth HTTP requests (respects system proxy). */
         internal val httpClient = OkHttpClient.Builder()
@@ -34,19 +57,93 @@ abstract class OAuthManager(
 
         /**
          * [T-android-oauth-log-redaction] Make an HTTP body safe to log:
-         * masks the VALUES of known credential fields (access_token,
-         * refresh_token, id_token, api_key/key, client_secret, device_code)
-         * and truncates to a diagnostic-sized prefix. OAuth failure bodies
-         * are usually just {"error":"invalid_grant"} — but some IdPs echo
-         * request material, and a malformed SUCCESS body reaching an error
-         * path would otherwise dump live credentials into logcat / the
-         * on-device log files.
+         * masks the VALUES of known credential fields and truncates to a
+         * diagnostic-sized prefix. Besides normal OAuth tokens, the list
+         * deliberately includes every secret used by the OpenAI device-code
+         * flow: the short user code, device authorization id, authorization
+         * code, and both halves of the PKCE exchange. OAuth failure bodies are
+         * usually just {"error":"invalid_grant"} — but some IdPs echo request
+         * material, and a malformed SUCCESS body reaching an error path would
+         * otherwise dump live credentials into logcat / the on-device logs.
+         *
+         * Valid JSON is traversed recursively, so a sensitive key is replaced
+         * regardless of whether its value is a string, primitive, object or
+         * array. If parsing fails but a sensitive-looking key is present, the
+         * complete body is withheld instead of trying to recover individual
+         * values with a partial regular expression. Key matching is
+         * case-insensitive so capitalization cannot bypass redaction.
          */
         fun sanitizeBody(body: String, maxLen: Int = 300): String {
-            val masked = Regex(
-                "\"(access_token|refresh_token|id_token|api_key|key|client_secret|device_code)\"\\s*:\\s*\"[^\"]*\"",
-            ).replace(body) { m -> "\"${m.groupValues[1]}\":\"***\"" }
+            val trimmed = body.trim()
+            val masked = try {
+                when {
+                    trimmed.startsWith("{") -> sanitizeJsonObject(JSONObject(trimmed)).toString()
+                    trimmed.startsWith("[") -> sanitizeJsonArray(JSONArray(trimmed)).toString()
+                    else -> sanitizeNonJsonBody(body)
+                }
+            } catch (_: Exception) {
+                sanitizeNonJsonBody(body)
+            }
             return if (masked.length <= maxLen) masked else masked.take(maxLen) + "…(${masked.length} chars)"
+        }
+
+        private fun sanitizeNonJsonBody(body: String): String {
+            if (SENSITIVE_BODY_KEY_PATTERN.containsMatchIn(body)) {
+                return "<redacted OAuth body: ${body.length} chars>"
+            }
+            return SENSITIVE_FORM_FIELD_PATTERN.replace(body) { match ->
+                "${match.groupValues[1]}${match.groupValues[2]}=***"
+            }
+        }
+
+        private fun sanitizeJsonObject(source: JSONObject): JSONObject {
+            val sanitized = JSONObject()
+            source.keys().forEach { key ->
+                val value = source.get(key)
+                sanitized.put(
+                    key,
+                    if (key.lowercase() in SENSITIVE_BODY_FIELDS) {
+                        "***"
+                    } else {
+                        sanitizeJsonValue(value)
+                    },
+                )
+            }
+            return sanitized
+        }
+
+        private fun sanitizeJsonArray(source: JSONArray): JSONArray {
+            val sanitized = JSONArray()
+            for (index in 0 until source.length()) {
+                sanitized.put(sanitizeJsonValue(source.get(index)))
+            }
+            return sanitized
+        }
+
+        private fun sanitizeJsonValue(value: Any?): Any? = when (value) {
+            is JSONObject -> sanitizeJsonObject(value)
+            is JSONArray -> sanitizeJsonArray(value)
+            else -> value
+        }
+
+        /**
+         * Return every encrypted OAuth preference key owned by one provider
+         * instance. Keeping this mapping in one pure helper makes deletion
+         * testable without an Android keystore and prevents a future caller
+         * from clearing a similarly named key belonging to another instance.
+         */
+        internal fun credentialPreferenceKeys(
+            instanceId: String,
+            additionalKeyNames: Set<String> = emptySet(),
+        ): Set<String> {
+            val keys = linkedSetOf(
+                "oauth_tokens_$instanceId",
+                "oauth_${KEY_MANUAL_BEARER}_$instanceId",
+            )
+            additionalKeyNames.forEach { keyName ->
+                keys += "oauth_${keyName}_$instanceId"
+            }
+            return keys
         }
 
         /** Create the appropriate OAuthManager for a provider instance. */
@@ -68,6 +165,14 @@ abstract class OAuthManager(
     abstract val callbackPort: Int
     abstract val redirectPath: String
     abstract val scopes: String
+
+    /**
+     * Provider-specific encrypted fields that belong to this instance in
+     * addition to the common token blob and optional manual bearer token.
+     * Subclasses list logical names only; [logout] applies the instance suffix
+     * centrally so cleanup cannot accidentally cross provider boundaries.
+     */
+    protected open val additionalCredentialKeyNames: Set<String> = emptySet()
 
     // `open` so a provider whose server-side allow-list pins a different
     // loopback spelling can override it (xAI registered 127.0.0.1, not
@@ -274,10 +379,10 @@ abstract class OAuthManager(
     }
 
     fun logout() {
-        getEncryptedPrefs().edit()
-            .remove("oauth_tokens_$instanceId")
-            .remove("oauth_${KEY_MANUAL_BEARER}_$instanceId")
-            .apply()
+        val editor = getEncryptedPrefs().edit()
+        credentialPreferenceKeys(instanceId, additionalCredentialKeyNames)
+            .forEach(editor::remove)
+        editor.apply()
     }
 
     // Token storage

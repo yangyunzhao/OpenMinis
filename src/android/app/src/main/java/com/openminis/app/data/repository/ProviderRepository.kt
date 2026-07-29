@@ -3,6 +3,7 @@ package com.openminis.app.data.repository
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
+import com.openminis.app.auth.OAuthManager
 import com.openminis.app.data.db.ProviderConfigDao
 import com.openminis.app.data.db.ProviderConfigMetaKeys
 import com.openminis.app.data.db.ProviderConfigSnapshot
@@ -53,6 +54,30 @@ private const val MODALITY_BIT_VID_IN = 1 shl 5
 private const val MODALITY_BIT_IMG_OUT = 1 shl 6
 private const val MODALITY_BIT_AUD_OUT = 1 shl 7
 private const val MODALITY_BIT_VID_OUT = 1 shl 8
+
+/**
+ * Remove every credential namespace owned by a deleted provider instance.
+ *
+ * The callbacks keep the decision logic independently testable: production
+ * supplies Android encrypted stores, while JVM tests supply in-memory sets.
+ * API-key cleanup always runs, including for a stale id whose config row has
+ * already disappeared. OAuth cleanup is intentionally limited to official
+ * OpenAI OAuth instances so deleting an API-key or compatible-endpoint
+ * provider cannot touch an unrelated OAuth namespace.
+ */
+internal fun clearRemovedProviderCredentials(
+    instanceId: String,
+    removedInstance: ProviderInstance?,
+    clearOAuthCredentials: (ProviderInstance) -> Unit,
+    clearApiKey: (String) -> Unit,
+) {
+    if (removedInstance?.providerType == ProviderType.openAI &&
+        removedInstance.credentialType == ProviderCredential.oauth
+    ) {
+        clearOAuthCredentials(removedInstance)
+    }
+    clearApiKey(instanceId)
+}
 
 class ProviderRepository(private val context: Context) {
 
@@ -671,6 +696,12 @@ class ProviderRepository(private val context: Context) {
         ensureConfigLoaded()
         invalidateModelCache(instanceId)
         val config = _config.value
+        // Capture the instance before removing it from the configuration. Its
+        // provider and credential types decide whether an encrypted OAuth
+        // namespace exists and therefore must be cleared along with the API-key
+        // mirror. Looking it up after removeAll() previously made complete
+        // credential cleanup impossible.
+        val removedInstance = config.instances.firstOrNull { it.id == instanceId }
         val removedEntryIds = config.modelEntries
             .filter { it.providerInstanceId == instanceId }
             .map { it.id }
@@ -692,7 +723,14 @@ class ProviderRepository(private val context: Context) {
         }
 
         saveConfig(config)
-        deleteApiKey(instanceId)
+        clearRemovedProviderCredentials(
+            instanceId = instanceId,
+            removedInstance = removedInstance,
+            clearOAuthCredentials = { instance ->
+                OAuthManager.forInstance(context, instance)?.logout()
+            },
+            clearApiKey = ::deleteApiKey,
+        )
     }
 
     /**

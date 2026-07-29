@@ -25,9 +25,71 @@ import kotlin.coroutines.resume
  */
 class OAuthNetworkUnreachableException(cause: Throwable) : Exception(cause.message, cause)
 
+/**
+ * Safe user-facing error for an OpenAI token endpoint rejection. The response
+ * body is intentionally not retained because providers may echo authorization
+ * codes, PKCE material, or tokens in an error payload.
+ */
+class OAuthTokenExchangeException(val statusCode: Int) :
+    Exception("Token exchange failed (HTTP $statusCode)")
+
+/**
+ * Safe error for a nominally successful token response that cannot be parsed.
+ * JSON parser messages are not propagated because some implementations embed
+ * a fragment of the malformed input in the exception text.
+ */
+class OAuthTokenResponseException :
+    Exception("Token endpoint returned an invalid response")
+
 class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(context, instanceId) {
     companion object {
         private const val TAG = "CodexOAuth"
+        private val OPENAI_CREDENTIAL_KEY_NAMES = setOf(
+            "verifier",
+            "state",
+            "account_id",
+            "plan_type",
+        )
+
+        /**
+         * Redact both values generated specifically for one browser login.
+         * The state is as sensitive as the PKCE challenge for log purposes:
+         * neither value is needed to diagnose the stable URL structure.
+         */
+        internal fun sanitizeAuthorizationUrl(url: String): String =
+            url.replace(
+                Regex("([?&])(state|code_challenge)=[^&]*", RegexOption.IGNORE_CASE),
+            ) { match ->
+                "${match.groupValues[1]}${match.groupValues[2]}=<redacted>"
+            }
+
+        /** Pure key mapping used by deletion regression tests. */
+        internal fun credentialPreferenceKeys(instanceId: String): Set<String> =
+            OAuthManager.credentialPreferenceKeys(instanceId, OPENAI_CREDENTIAL_KEY_NAMES)
+
+        /**
+         * Validate the status without accepting the response body. Keeping the
+         * body out of this API makes it impossible for the thrown exception to
+         * retain or interpolate server-controlled credential material.
+         */
+        internal fun requireSuccessfulTokenResponse(statusCode: Int) {
+            if (statusCode !in 200..299) {
+                throw OAuthTokenExchangeException(statusCode)
+            }
+        }
+
+        /**
+         * Parse a successful token payload while converting parser failures to
+         * a fixed, body-free exception. The original JSONException is
+         * deliberately not attached as a cause because its message may quote
+         * the malformed input.
+         */
+        internal fun parseTokenResponse(responseBody: String): JSONObject =
+            try {
+                JSONObject(responseBody)
+            } catch (_: Exception) {
+                throw OAuthTokenResponseException()
+            }
 
         /**
          * Static helper: perform full login flow and save the access token.
@@ -44,6 +106,9 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
     private var loginCallbackServer: OAuthCallbackServer? = null
     private var expectedState: String? = null
 
+    override val additionalCredentialKeyNames: Set<String>
+        get() = OPENAI_CREDENTIAL_KEY_NAMES
+
     /**
      * Perform the full OAuth login flow.
      * Returns the access token. Throws on failure.
@@ -55,10 +120,7 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
         loginCallbackServer = null
 
         val authUrl = buildAuthorizationUrl()
-        // Redact the code_challenge so the log doesn't expose PKCE material
-        // verbatim — leave everything else so the user/diagnostician can
-        // verify scope, redirect_uri, client_id, state.
-        val redactedAuthUrl = authUrl.replace(Regex("code_challenge=[^&]+"), "code_challenge=<redacted>")
+        val redactedAuthUrl = sanitizeAuthorizationUrl(authUrl)
         AppLogger.info(TAG, "authorize URL: $redactedAuthUrl")
         AppLogger.info(TAG, "redirect_uri=$redirectUri callbackPort=$callbackPort")
 
@@ -94,7 +156,7 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
             val stateMatches = expectedState != null && state == expectedState
             AppLogger.info(
                 TAG,
-                "callback received: codeLen=${code.length} state=$state expected=$expectedState match=$stateMatches",
+                "callback received: codeLen=${code.length} statePresent=${state != null} match=$stateMatches",
             )
             if (!stateMatches) {
                 AppLogger.warning(TAG, "state mismatch — proceeding anyway to mirror prior behaviour")
@@ -210,15 +272,25 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
         response.close()
         AppLogger.info(
             TAG,
-            "token exchange response: $responseCode bodyLen=${responseBody.length} body[0..500]=${responseBody.take(500)}",
+            "token exchange response: $responseCode bodyLen=${responseBody.length}",
         )
 
-        if (responseCode !in 200..299) {
+        try {
+            requireSuccessfulTokenResponse(responseCode)
+        } catch (error: OAuthTokenExchangeException) {
             AppLogger.error(TAG, "token exchange non-2xx: $responseCode")
-            throw Exception("Token exchange failed ($responseCode): $responseBody")
+            throw error
         }
 
-        val json = JSONObject(responseBody)
+        val json = try {
+            parseTokenResponse(responseBody)
+        } catch (error: OAuthTokenResponseException) {
+            AppLogger.error(
+                TAG,
+                "token exchange response parse failed: OAuthTokenResponseException",
+            )
+            throw error
+        }
         val accessToken = json.optString("access_token", "")
         if (accessToken.isEmpty()) {
             AppLogger.error(TAG, "no access_token field in response")
