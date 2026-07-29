@@ -10,7 +10,7 @@
 - Phase 0 协议复核日期：2026-07-30
 - OpenMinis 调查基线：`94ab49cbb61203cc95ecd327f34969a2afeb7771`
 - Codex 调查基线：本机 `codex-cli 0.145.0`；官方 `device_code_auth.rs` 最近修改提交 `d4fcb2873bf23464cfacd804a31d46529db943b0`
-- 本次阶段：Phase 0 已开始，但 Android 工具链基线被阻塞；尚未授权或开始修改产品代码
+- 实施进度：Phase 0～Phase 5 已通过；Phase 6 等待用户真机验收；最新状态和证据见工作记录与各 Phase 报告
 
 本文件位于 `znmlr/`，用于保存个人 Fork 的长期需求和维护决策。它不得覆盖或削弱 [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md) 中的约定：
 

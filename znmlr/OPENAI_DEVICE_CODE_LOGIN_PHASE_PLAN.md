@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-- 状态：实施中；Phase 0～Phase 4 已通过，Phase 5 待开始
+- 状态：实施中；Phase 0～Phase 5 已通过，Phase 6 待用户真机验收
 - 对应需求：[OPENAI_DEVICE_CODE_LOGIN_REQUIREMENTS.md](OPENAI_DEVICE_CODE_LOGIN_REQUIREMENTS.md)
 - 适用仓库：个人 Fork `yangyunzhao/OpenMinis`
 - 官方上游：`OpenMinis/OpenMinis`
@@ -15,12 +15,12 @@
 
 ### 2.1 当前阶段
 
-当前处于“设计与安全基线”阶段：
+当前处于“真机验收准备”阶段：
 
-- 需求和主要产品决策已经确认；
-- OpenMinis 已有浏览器 OAuth、加密凭据存储、自动刷新和 Kimi 设备码 UI 先例；
-- OpenAI/Codex 当前设备授权不是稳定的标准 RFC 8628，实施前后都需要重新核实；
-- 当前 OpenAI OAuth 日志、敏感字段脱敏和删除 Provider 的凭据清理存在直接相关的安全缺口；
+- Phase 0～Phase 5 的需求、协议、安全、状态、UI、持久化和自动化门禁已经通过；
+- 可验证的 Debug APK 已从 Phase 5 产品提交构建，身份信息记录在 Phase 5 报告和 Phase 6 清单；
+- 2026-07-30 再次核对官方 Codex `main`：设备授权端点形状、轮询状态和 15 分钟超时仍与实现一致；
+- OpenAI/Codex 设备授权仍不是承诺稳定的标准 RFC 8628，真机执行前仍需关注服务端变化；
 - 本地不启动 Android 模拟器，真实登录和生命周期验收需要用户在真实 Android 设备上执行。
 
 ### 2.2 总体策略
@@ -61,9 +61,9 @@
 | Phase 2 | OpenAI 设备授权协议核心 | 独立协议模型、HTTP 客户端、轮询分类与 Token 交换 | MockWebServer 和纯逻辑测试 | 已通过：16 项 focused tests 全绿；完整测试仍为 39 个基线失败 |
 | Phase 3 | 登录状态、并发与生命周期 | 状态机、取消、超时、重试、迟到结果保护 | 协程虚拟时间和并发测试 | 已通过：24 项协调器测试全绿；完整测试仍为 39 个基线失败 |
 | Phase 4 | 新增 Provider UI 与持久化集成 | 双登录入口、设备码界面、Custom Tab、凭据和模型集成 | JVM 测试、编译、静态审查 | 已通过：78 项安全/兼容 focused tests 全绿；完整 460 项测试仍为相同 39 个基线失败；最终独立审查无 blocker/high |
-| Phase 5 | 自动化回归与 Debug 构建 | 完整 JVM 回归结果、Debug APK | `testDebugUnitTest`、`assembleDebug` | 未开始 |
-| Phase 6 | 用户真机验收与缺陷闭环 | 真机检查表、用户结果、必要修复 | 用户真实设备验收 | 未开始 |
-| Phase 7 | 交付、推送与持续维护 | 最终文档、个人远端分支、APK/源码对应关系 | Git、安全、许可证和维护检查 | 未开始 |
+| Phase 5 | 自动化回归与 Debug 构建 | 完整 JVM 回归结果、Debug APK | `testDebugUnitTest`、`assembleDebug` | [已通过](OPENAI_DEVICE_CODE_LOGIN_PHASE5_REPORT.md)：11 项刷新测试、89 项安全/兼容聚焦测试通过；完整 471 项仍为 39 个基线失败；Debug APK 构建成功 |
+| Phase 6 | 用户真机验收与缺陷闭环 | 真机检查表、用户结果、必要修复 | 用户真实设备验收 | [清单和 APK 已准备](OPENAI_DEVICE_CODE_LOGIN_PHASE6_DEVICE_CHECKLIST.md)，待用户执行，尚未通过 |
+| Phase 7 | 交付、推送与持续维护 | 最终文档、个人远端分支、APK/源码对应关系 | Git、安全、许可证和维护检查 | [交付材料已预备](OPENAI_DEVICE_CODE_LOGIN_PHASE7_HANDOFF.md)；正式门禁等待 Phase 6 |
 
 Phase 依赖关系为：
 
