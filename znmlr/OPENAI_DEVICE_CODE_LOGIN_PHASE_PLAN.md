@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-- 状态：实施计划基线；Phase 0 被 Android 工具链缺失阻塞
+- 状态：实施中；Phase 0 已通过（已记录 JVM/Lint 基线失败），Phase 1 进行中
 - 对应需求：[OPENAI_DEVICE_CODE_LOGIN_REQUIREMENTS.md](OPENAI_DEVICE_CODE_LOGIN_REQUIREMENTS.md)
 - 适用仓库：个人 Fork `yangyunzhao/OpenMinis`
 - 官方上游：`OpenMinis/OpenMinis`
@@ -56,8 +56,8 @@
 
 | Phase | 名称 | 核心产出 | 主要验证 | 状态 |
 |---|---|---|---|---|
-| Phase 0 | 基线、分支与协议复核 | 干净功能分支、基线记录、冻结后的两份文档 | Git/remote/基线测试检查 | 被阻塞：Android 工具链缺失 |
-| Phase 1 | 安全与凭据清理基础 | 日志脱敏、错误收口、删除 OpenAI OAuth Provider 完整清理 | JVM 单元测试、现有 OAuth 回归 | 未开始 |
+| Phase 0 | 基线、分支与协议复核 | 干净功能分支、基线记录、冻结后的两份文档 | Git/remote/基线测试检查 | 已通过：记录 39 个 JVM 失败、3 个 Lint 崩溃；Debug APK 通过 |
+| Phase 1 | 安全与凭据清理基础 | 日志脱敏、错误收口、删除 OpenAI OAuth Provider 完整清理 | JVM 单元测试、现有 OAuth 回归 | 进行中 |
 | Phase 2 | OpenAI 设备授权协议核心 | 独立协议模型、HTTP 客户端、轮询分类与 Token 交换 | MockWebServer 和纯逻辑测试 | 未开始 |
 | Phase 3 | 登录状态、并发与生命周期 | 状态机、取消、超时、重试、迟到结果保护 | 协程虚拟时间和并发测试 | 未开始 |
 | Phase 4 | 新增 Provider UI 与持久化集成 | 双登录入口、设备码界面、Custom Tab、凭据和模型集成 | JVM 测试、编译、静态审查 | 未开始 |

@@ -2,14 +2,16 @@
 
 ## 1. 结论
 
-- 状态：被阻塞
-- 执行时间：2026-07-30 00:27～00:37（Asia/Shanghai）
-- 阻塞范围：Android JVM 测试、Lint 和 Debug APK 基线
-- 已通过范围：文档保护、`main` 同步、正式功能分支、remote 安全、上游包含关系、官方协议复核
+- 状态：通过（已准确记录基线已有失败）
+- 执行时间：2026-07-30 00:27～02:23（Asia/Shanghai）
+- 已通过范围：文档保护、`main` 同步、正式功能分支、remote 安全、上游包含关系、官方协议复核、工具链准备、Debug APK 构建
+- 基线已有失败：JVM 测试 39 项失败；Lint 的 3 个分析任务崩溃
 - 产品代码修改：无
-- 是否允许进入 Phase 1：否
+- 是否允许进入 Phase 1：是
 
-Phase 0 已经建立 Git 和协议基线，但本机没有满足项目要求的 Android 工具链，Gradle Wrapper 也未完成首次启动。因此不能取得可信的修改前测试、Lint 和构建结果，Phase 0 不能标为“通过”。
+Phase 0 已建立 Git、协议、工具链、测试、Lint 和 Debug APK 基线。JVM 与 Lint
+不是全绿，但失败集合已经在修改产品代码前完整记录并分类；Debug APK 已成功生成。
+后续 Phase 必须保证 focused tests 全绿，并证明完整验证没有新增或恶化这些基线失败。
 
 ## 2. Git 与分支基线
 
@@ -91,14 +93,14 @@ Phase 0 已经建立 Git 和协议基线，但本机没有满足项目要求的 
 
 | 项目 | 项目要求 | 本机实际 | 结果 |
 |---|---|---|---|
-| JDK | 17 | Windows JDK 25.0.3；WSL JDK 11 | 不符合 |
-| Gradle Wrapper | 8.11.1 | 脚本存在，分发包未下载完成 | 被阻塞 |
-| Android SDK | compileSdk 36 | 未发现 SDK，环境变量和 `local.properties` 均为空 | 缺失 |
-| Android NDK | r28+ | 未发现 | 缺失 |
-| CMake | SDK CMake 3.22.1 | Windows 4.3.0；WSL 4.2.3 | 不符合 |
+| JDK | 17 | Windows Microsoft OpenJDK 17.0.10（用户级安装）；WSL OpenJDK 17.0.19 | 通过 |
+| Gradle Wrapper | 8.11.1 | 官方分发包 SHA-256 核对后预置 WSL Wrapper 缓存；`--version` 通过 | 通过 |
+| Android SDK | compileSdk 36 | WSL `/root/Android/Sdk`；platform 36 revision 2 | 通过 |
+| Android NDK | r28+ | r28c（28.2.13676358）用于 PRoot；AGP 另行解析默认 NDK 27.0.12077973 | 通过并记录用途差异 |
+| CMake | SDK CMake 3.22.1 | Android SDK CMake 3.22.1 | 通过 |
 | POSIX shell | 能执行 `gradlew` | Git Bash 5.2.37、WSL2 Ubuntu 可用 | 通过 |
-| PRoot 资源 | `assets/proot-aarch64`、`jniLibs/arm64-v8a/libproot.so` | 缺失 | 缺失 |
-| Alpine rootfs | `assets/alpine-minirootfs.tar.gz` | 缺失 | 缺失 |
+| PRoot 资源 | `assets/proot-aarch64`、`jniLibs/arm64-v8a/libproot.so` | 使用 NDK r28c 生成；构建警告已保留 | 通过 |
+| Alpine rootfs | `assets/alpine-minirootfs.tar.gz` | Alpine 3.21.3 minirootfs 已准备 | 通过 |
 | 顶层子模块 | 与父仓库 gitlink 一致 | `deps/ish`、`deps/proot` 一致 | 通过 |
 | 嵌套 Linux 子模块 | `update = none` | 未初始化并被同步脚本正常跳过 | 符合预期 |
 
@@ -108,7 +110,11 @@ Phase 0 已经建立 Git 和协议基线，但本机没有满足项目要求的 
 - GitHub CLI：`2.96.0`
 - Android Gradle Plugin：`8.7.3`
 - Kotlin：`2.1.0`
+- Android command-line tools：22.0（Linux 15859902）
+- SDK build-tools：36.0.0（AGP 另行安装 34.0.0）
+- SDK platform-tools：37.0.0
 - 仓库只有 `src/android/gradlew`，没有 `gradlew.bat`
+- `src/android/local.properties` 只保存本机 SDK 路径并被 Git 忽略
 
 ## 5. 基线验证执行结果
 
@@ -119,43 +125,104 @@ Phase 0 已经建立 Git 和协议基线，但本机没有满足项目要求的 
 - 分支祖先关系检查：通过
 - 两份文档 UTF-8、尾随空白和本地链接检查：通过
 - 官方设备授权协议复核：通过
+- Gradle Wrapper 8.11.1 启动：通过
+- PRoot 与 Alpine Android 资源准备：通过
+- `:app:testDebugUnitTest`：已执行，390 项中 39 项基线已有失败
+- `:app:lintDebug`：已执行，3 个 Lint 分析任务发生基线工具崩溃
+- `:app:assembleDebug`：通过
 
 ### 5.2 Gradle Wrapper 启动
 
-在 Git Bash 中执行：
+在 WSL Ubuntu 中使用 JDK 17 执行：
 
 ```bash
-cd /d/repositories/OpenMinis/src/android
+cd /mnt/d/repositories/OpenMinis/src/android
 ./gradlew --version
 ```
 
 实际结果：
 
-- 首次尝试没有通过系统代理下载 Gradle 分发包；
-- 第二次仅为该进程设置 Java/Gradle 代理参数，仍在 64 秒工具时限内无下载进度；
-- `.gradle/wrapper` 中只生成了 0 字节临时文件；
-- 两次遗留的 Gradle Wrapper Java 进程均已停止；
-- 没有修改仓库或全局 Gradle 配置；
-- `curl` 对 Gradle 分发地址的只读 HEAD 请求可以经过当前代理到达，但 Java Wrapper 下载仍未成功。
+- Gradle 8.11.1 官方分发包经当前网络路径下载较慢；
+- 改用可续传下载，并用官方 SHA-256
+  `f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6`
+  核对后预置 WSL Wrapper 缓存；
+- `./gradlew --version` 使用 WSL OpenJDK 17.0.19 成功；
+- 未修改仓库中的 Wrapper URL，也未修改全局 Gradle 配置。
 
-### 5.3 未执行
+### 5.3 JVM 测试基线
 
-以下命令没有真正启动：
+执行：
 
 ```bash
-./gradlew :app:testDebugUnitTest
-./gradlew :app:lintDebug
-./gradlew :app:assembleDebug
+./gradlew --no-daemon --console=plain :app:testDebugUnitTest
 ```
 
-原因：
+结果：`390 tests completed, 39 failed`，0 error，0 skipped，约 19 分 56 秒。
 
-1. Gradle 8.11.1 分发包尚不可用；
-2. 缺少项目要求的 JDK 17；
-3. Android SDK 36、NDK r28+ 和 SDK CMake 3.22.1 缺失；
-4. Debug APK 需要的 PRoot 和 Alpine 构建产物缺失。
+失败集合：
 
-这些结果只能标记为“环境阻塞、未执行”，不能标记为测试或构建通过，也不能据此判断当前代码基线是否健康。
+- `AnthropicProviderTest`：31 项中 24 项失败。主要签名为缺少私有配置
+  `ANTHROPIC_OAUTH_IDENTIFIER_PROMPT`；其中预期异常测试也因此先收到
+  `IllegalStateException`。
+- `OpenAIProviderTest`：21 项中 11 项失败。失败签名均为
+  `TransientError: Server returned an empty response`，发生在 MockWebServer
+  相关的 `sendMessage` 测试。
+- `TerminalSanitizerTest`：27 项中 4 项比较失败。失败集中在回车覆盖折叠后的
+  空格/原文本保留差异。
+
+HTML 报告：
+`src/android/app/build/reports/tests/testDebugUnitTest/index.html`。
+
+这些失败发生在产品修改前，后续只作为回归对照，不能当成本功能通过的证据。
+
+### 5.4 Lint 基线
+
+执行：
+
+```bash
+./gradlew --no-daemon --console=plain :app:lintDebug
+```
+
+结果：失败，约 2 分 53 秒。3 个分析任务均由 Android Lint/Kotlin Analysis API
+类兼容问题崩溃，而不是报告普通 lint issue：
+
+- `:app:lintAnalyzeDebug`：分析 `MainActivity.kt` 时，
+  `NonNullableMutableLiveDataDetector` 抛出 `IncompatibleClassChangeError`；
+- `:app:lintAnalyzeDebugAndroidTest`：分析
+  `ExecutionCoordinatorInstrumentedTest.kt` 时，
+  `FrequentlyChangingValueDetector` 抛出同类错误；
+- `:app:lintAnalyzeDebugUnitTest`：分析 `ToolLoopDetectorTest.kt` 时，
+  `FrequentlyChangingValueDetector` 抛出同类错误。
+
+仓库已有注释说明 `NonNullableMutableLiveData` detector 会在禁用列表生效前崩溃；
+本次 Debug Lint 证明当前组合中该问题仍存在。后续不得新增 Lint 崩溃类型或数量。
+
+### 5.5 Debug APK 基线
+
+执行：
+
+```bash
+./gradlew --no-daemon --console=plain :app:assembleDebug
+```
+
+第一次到达 `stageDebugSkillAssets` 时发现被 Git 忽略的
+`.claude/skills/debug-server` 目录不存在；脚本本身允许缺少 `SKILL.md` 并生成占位文档，
+但 Gradle 输入校验会先拒绝不存在的目录。创建空的忽略目录后，构建继续。
+
+随后发现 Windows checkout 将 POSIX 脚本写为 CRLF。仅在构建期间把 `gradlew`、
+资源脚本和 `gen_debug_skill_android.sh` 机械转换为 LF；构建结束后全部恢复为原 CRLF，
+没有提交行尾变化。
+
+最终结果：通过，约 2 分 34 秒，42 个 actionable task（21 executed，
+21 up-to-date）。
+
+- APK：`src/android/app/build/outputs/apk/debug/app-debug.apk`
+- 大小：39,275,133 bytes
+- SHA-256：
+  `9C7EED1195BD22F8FF1F43BC8D3646E26E45EB703D5A769AF7325D8ED897D3A9`
+- 非阻塞警告：AGP 8.7.3 只验证至 compileSdk 35，但项目使用 36；
+  CMake 报 SDK XML 版本 4/3 兼容警告；Manifest/PackagingOptions 对
+  `extractNativeLibs` 给出建议。
 
 ## 6. 安全边界
 
@@ -176,28 +243,19 @@ cd /d/repositories/OpenMinis/src/android
 | 正式功能分支来自最新个人 `main` | 通过 |
 | remote 和 push 保护 | 通过 |
 | 官方协议与需求一致 | 通过 |
-| Android 工具链满足项目要求 | 未通过 |
-| 修改前 JVM 测试基线 | 被阻塞，未执行 |
-| 修改前 Lint 基线 | 被阻塞，未执行 |
-| 修改前 Debug APK 基线 | 被阻塞，未执行 |
-| 工作区干净 | 待本报告提交后复核 |
+| Android 工具链满足项目要求 | 通过 |
+| 修改前 JVM 测试基线 | 已建立：390 项中 39 项基线已有失败 |
+| 修改前 Lint 基线 | 已建立：3 个分析任务基线崩溃 |
+| 修改前 Debug APK 基线 | 通过 |
+| 工作区干净 | 本报告及相关状态文档提交后复核 |
 
-最终状态：**被阻塞**。
+最终状态：**通过（带已记录基线失败）**。
 
-## 8. 解除阻塞所需条件
+## 8. 后续 Phase 的基线约束
 
-进入 Phase 1 前至少需要：
-
-1. 安装并选择 JDK 17；
-2. 安装 Android SDK，并提供 platform 36；
-3. 安装 Android NDK r28+；
-4. 安装 SDK CMake 3.22.1；
-5. 配置 `ANDROID_HOME`、`ANDROID_SDK_ROOT` 或 `src/android/local.properties`；
-6. 让 Gradle Wrapper 能通过当前网络代理完成首次下载；
-7. 按 `BUILDING.md` 生成：
-   - `assets/proot-aarch64`
-   - `jniLibs/arm64-v8a/libproot.so`
-   - `assets/alpine-minirootfs.tar.gz`
-8. 重新执行 JVM 测试、Lint 和 Debug APK 构建并记录真实结果。
-
-安装 JDK、Android SDK/NDK/CMake 和下载构建资源会改变本机环境并产生较大下载量。本报告不把“开始 Phase 0”解释为自动安装这些工具；需要用户明确同意后再进行。
+1. 本功能新增或直接相关的 focused JVM tests 必须全部通过；
+2. 完整 JVM 测试应与本报告的 39 项失败集合、数量和错误签名比较，不得新增或恶化；
+3. Lint 应与本报告的 3 个分析任务崩溃比较，不得新增崩溃类型或数量；
+4. Debug APK 必须继续可构建；
+5. 任何因为环境或上游变化导致的基线变化，都必须先更新证据和本报告，不能静默接受；
+6. 继续遵守不启动模拟器、不使用真实账号、不发起真实模型请求的安全边界。
