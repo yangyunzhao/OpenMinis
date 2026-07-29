@@ -91,33 +91,33 @@ class OpenAIDeviceTokens internal constructor(
     val refreshToken: String,
     val idToken: String,
     val expiresInSeconds: Long?,
+    val expiresAtEpochMillis: Long?,
 ) {
+    init {
+        require((expiresInSeconds == null) == (expiresAtEpochMillis == null))
+    }
+
     /**
-     * Convert to the exact JSON shape consumed by OAuthManager, adding its
-     * absolute `expire_at` field only when the server supplied `expires_in`.
-     * This method does not write storage; Phase 4 owns the commit boundary.
+     * Convert to the exact JSON shape consumed by OAuthManager. The absolute
+     * expiry was fixed when the HTTP response arrived, so waiting on the
+     * confirmation screen cannot incorrectly extend token validity.
      */
-    internal fun toOAuthStorageJson(nowEpochMillis: Long): String {
+    internal fun toOAuthStorageJson(): String {
         val json = JSONObject()
             .put("access_token", accessToken)
             .put("refresh_token", refreshToken)
             .put("id_token", idToken)
         expiresInSeconds?.let { seconds ->
             json.put("expires_in", seconds)
-            val deltaMillis = seconds * 1_000L
-            val expireAt = if (nowEpochMillis > Long.MAX_VALUE - deltaMillis) {
-                Long.MAX_VALUE
-            } else {
-                nowEpochMillis + deltaMillis
-            }
-            json.put("expire_at", expireAt)
+            json.put("expire_at", requireNotNull(expiresAtEpochMillis))
         }
         return json.toString()
     }
 
     override fun toString(): String =
         "OpenAIDeviceTokens(accessToken=<redacted>, refreshToken=<redacted>, " +
-            "idToken=<redacted>, expiresInSeconds=$expiresInSeconds)"
+            "idToken=<redacted>, expiresInSeconds=$expiresInSeconds, " +
+            "expiresAtEpochMillis=$expiresAtEpochMillis)"
 }
 
 enum class OpenAIDeviceProtocolError {
@@ -137,6 +137,7 @@ enum class OpenAIDeviceProtocolError {
 /** Body-free error classification shared by all three protocol operations. */
 sealed interface OpenAIDeviceAuthError {
     data object Network : OpenAIDeviceAuthError
+    data object Internal : OpenAIDeviceAuthError
     data class HttpStatus(val statusCode: Int) : OpenAIDeviceAuthError
     data class InvalidResponse(val reason: OpenAIDeviceProtocolError) : OpenAIDeviceAuthError
 }
@@ -195,6 +196,7 @@ interface OpenAIDeviceAuthProtocol {
 class OpenAIDeviceAuthClient(
     private val endpoints: OpenAIDeviceAuthEndpoints = OpenAIDeviceAuthDefaults.endpoints,
     private val callFactory: Call.Factory = defaultHttpClient,
+    private val currentTimeMillis: () -> Long = System::currentTimeMillis,
 ) : OpenAIDeviceAuthProtocol {
 
     override suspend fun requestDeviceAuthorization(): OpenAIDeviceAuthorizationResult {
@@ -268,6 +270,7 @@ class OpenAIDeviceAuthClient(
                 classifyTokenResponse(
                     statusCode = response.code,
                     body = response.body?.string().orEmpty(),
+                    receivedAtEpochMillis = currentTimeMillis(),
                 )
             }
         } catch (_: IOException) {
@@ -380,6 +383,7 @@ class OpenAIDeviceAuthClient(
         internal fun classifyTokenResponse(
             statusCode: Int,
             body: String,
+            receivedAtEpochMillis: Long,
         ): OpenAIDeviceTokenResult {
             if (statusCode !in 200..299) {
                 return OpenAIDeviceTokenResult.Failure(
@@ -401,6 +405,12 @@ class OpenAIDeviceAuthClient(
             } else {
                 null
             }
+            val expiresAt = expiresIn?.let { seconds ->
+                addMillisSaturated(
+                    receivedAtEpochMillis,
+                    seconds * 1_000L,
+                )
+            }
 
             return OpenAIDeviceTokenResult.Success(
                 OpenAIDeviceTokens(
@@ -408,9 +418,17 @@ class OpenAIDeviceAuthClient(
                     refreshToken = refreshToken,
                     idToken = idToken,
                     expiresInSeconds = expiresIn,
+                    expiresAtEpochMillis = expiresAt,
                 ),
             )
         }
+
+        private fun addMillisSaturated(base: Long, delta: Long): Long =
+            if (base > Long.MAX_VALUE - delta) {
+                Long.MAX_VALUE
+            } else {
+                base + delta
+            }
 
         private fun parseJson(body: String): JSONObject? =
             try {

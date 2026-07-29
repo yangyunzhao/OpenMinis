@@ -55,6 +55,7 @@ class OpenAIDeviceAuthClientTest {
                 .proxy(Proxy.NO_PROXY)
                 .readTimeout(2, TimeUnit.SECONDS)
                 .build(),
+            currentTimeMillis = { 1_000L },
         )
     }
 
@@ -296,8 +297,9 @@ class OpenAIDeviceAuthClientTest {
             assertEquals("refresh-secret", result.tokens.refreshToken)
             assertEquals("id-secret", result.tokens.idToken)
             assertEquals(3600L, result.tokens.expiresInSeconds)
+            assertEquals(3_601_000L, result.tokens.expiresAtEpochMillis)
 
-            val stored = JSONObject(result.tokens.toOAuthStorageJson(1_000L))
+            val stored = JSONObject(result.tokens.toOAuthStorageJson())
             assertEquals("access-secret", stored.getString("access_token"))
             assertEquals("refresh-secret", stored.getString("refresh_token"))
             assertEquals("id-secret", stored.getString("id_token"))
@@ -311,16 +313,21 @@ class OpenAIDeviceAuthClientTest {
         val result = OpenAIDeviceAuthClient.classifyTokenResponse(
             200,
             """{"access_token":"a","refresh_token":"r","id_token":"i","expires_in":2}""",
+            Long.MAX_VALUE - 1,
         ) as OpenAIDeviceTokenResult.Success
 
-        val stored = JSONObject(result.tokens.toOAuthStorageJson(Long.MAX_VALUE - 1))
+        val stored = JSONObject(result.tokens.toOAuthStorageJson())
         assertEquals(Long.MAX_VALUE, stored.getLong("expire_at"))
     }
 
     @Test
     fun `token exchange rejects unsafe responses without retaining body`() {
         listOf(400, 401, 429, 500).forEach { status ->
-            val failure = OpenAIDeviceAuthClient.classifyTokenResponse(status, "response-secret")
+            val failure = OpenAIDeviceAuthClient.classifyTokenResponse(
+                status,
+                "response-secret",
+                1_000L,
+            )
                 as OpenAIDeviceTokenResult.Failure
             assertEquals(OpenAIDeviceAuthError.HttpStatus(status), failure.error)
             assertFalse(failure.toString().contains("response-secret"))
@@ -358,7 +365,11 @@ class OpenAIDeviceAuthClientTest {
                 OpenAIDeviceProtocolError.INVALID_EXPIRES_IN,
         )
         invalidBodies.forEach { (body, expectedReason) ->
-            val failure = OpenAIDeviceAuthClient.classifyTokenResponse(200, body)
+            val failure = OpenAIDeviceAuthClient.classifyTokenResponse(
+                200,
+                body,
+                1_000L,
+            )
                 as OpenAIDeviceTokenResult.Failure
             assertEquals(
                 OpenAIDeviceAuthError.InvalidResponse(expectedReason),
@@ -372,10 +383,11 @@ class OpenAIDeviceAuthClientTest {
         val success = OpenAIDeviceAuthClient.classifyTokenResponse(
             200,
             """{"access_token":"a","refresh_token":"r","id_token":"i"}""",
+            1_000L,
         ) as OpenAIDeviceTokenResult.Success
 
         assertEquals(null, success.tokens.expiresInSeconds)
-        val stored = JSONObject(success.tokens.toOAuthStorageJson(1_000L))
+        val stored = JSONObject(success.tokens.toOAuthStorageJson())
         assertFalse(stored.has("expires_in"))
         assertFalse(stored.has("expire_at"))
     }
@@ -465,6 +477,7 @@ class OpenAIDeviceAuthClientTest {
                     "refresh-secret",
                     "id-secret",
                     3600,
+                    3_601_000L,
                 ),
             ),
         )
