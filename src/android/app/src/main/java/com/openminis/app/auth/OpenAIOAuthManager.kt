@@ -170,9 +170,9 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
         return accessToken
     }
 
-    override val authURL = "https://auth.openai.com/oauth/authorize"
-    override val tokenURL = "https://auth.openai.com/oauth/token"
-    override val clientId = "app_EMoamEEZ73f0CkXaXp7hrann"
+    override val authURL = "${OpenAIDeviceAuthDefaults.ISSUER}/oauth/authorize"
+    override val tokenURL = OpenAIDeviceAuthDefaults.endpoints.exchangeTokenUrl.toString()
+    override val clientId = OpenAIDeviceAuthDefaults.CLIENT_ID
     override val clientSecret: String? = null
     override val callbackPort = 1455
     override val redirectPath = "/auth/callback"
