@@ -108,7 +108,7 @@ try {
     Invoke-GitWithRetry -Arguments @(
         '-c', 'http.version=HTTP/1.1',
         'fetch', '--prune', 'origin',
-        "${MainBranch}:refs/remotes/origin/${MainBranch}"
+        "refs/heads/${MainBranch}:refs/remotes/origin/${MainBranch}"
     )
     Invoke-Git -Arguments @('merge', '--ff-only', "origin/$MainBranch")
 
@@ -116,7 +116,7 @@ try {
     Invoke-GitWithRetry -Arguments @(
         '-c', 'http.version=HTTP/1.1',
         'fetch', '--prune', 'upstream',
-        "${MainBranch}:refs/remotes/upstream/${MainBranch}"
+        "refs/heads/${MainBranch}:refs/remotes/upstream/${MainBranch}"
     )
 
     & git merge --no-edit "upstream/$MainBranch"
