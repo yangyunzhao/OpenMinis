@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-- 状态：实施计划基线
+- 状态：实施计划基线；Phase 0 被 Android 工具链缺失阻塞
 - 对应需求：[OPENAI_DEVICE_CODE_LOGIN_REQUIREMENTS.md](OPENAI_DEVICE_CODE_LOGIN_REQUIREMENTS.md)
 - 适用仓库：个人 Fork `yangyunzhao/OpenMinis`
 - 官方上游：`OpenMinis/OpenMinis`
@@ -56,7 +56,7 @@
 
 | Phase | 名称 | 核心产出 | 主要验证 | 状态 |
 |---|---|---|---|---|
-| Phase 0 | 基线、分支与协议复核 | 干净功能分支、基线记录、冻结后的两份文档 | Git/remote/基线测试检查 | 计划中 |
+| Phase 0 | 基线、分支与协议复核 | 干净功能分支、基线记录、冻结后的两份文档 | Git/remote/基线测试检查 | 被阻塞：Android 工具链缺失 |
 | Phase 1 | 安全与凭据清理基础 | 日志脱敏、错误收口、删除 OpenAI OAuth Provider 完整清理 | JVM 单元测试、现有 OAuth 回归 | 未开始 |
 | Phase 2 | OpenAI 设备授权协议核心 | 独立协议模型、HTTP 客户端、轮询分类与 Token 交换 | MockWebServer 和纯逻辑测试 | 未开始 |
 | Phase 3 | 登录状态、并发与生命周期 | 状态机、取消、超时、重试、迟到结果保护 | 协程虚拟时间和并发测试 | 未开始 |
@@ -110,6 +110,7 @@ Phase 0
 - `feature/openai-device-code-login` 功能分支；
 - 已确认的需求文档；
 - 本分阶段计划；
+- [Phase 0 验收报告](OPENAI_DEVICE_CODE_LOGIN_PHASE0_REPORT.md)；
 - 基线提交、工具链和测试结果记录；
 - 已知基线失败清单。
 

@@ -6,10 +6,11 @@
 - 来源：由原仓库根目录临时草稿 `tmp.md` 整理，并结合当前代码与官方 Codex 行为调查；原临时草稿已于 2026-07-30 按用户要求删除
 - 目标仓库：个人 Fork `yangyunzhao/OpenMinis`
 - 上游仓库：`OpenMinis/OpenMinis`
-- 调查日期：2026-07-29
+- 初次调查日期：2026-07-29
+- Phase 0 协议复核日期：2026-07-30
 - OpenMinis 调查基线：`94ab49cbb61203cc95ecd327f34969a2afeb7771`
-- Codex 调查基线：本机 `codex-cli 0.145.0` 及调查日期当天的官方源码
-- 本次阶段：只整理、核实和讨论需求，不代表已经授权修改产品代码
+- Codex 调查基线：本机 `codex-cli 0.145.0`；官方 `device_code_auth.rs` 最近修改提交 `d4fcb2873bf23464cfacd804a31d46529db943b0`
+- 本次阶段：Phase 0 已开始，但 Android 工具链基线被阻塞；尚未授权或开始修改产品代码
 
 本文件位于 `znmlr/`，用于保存个人 Fork 的长期需求和维护决策。它不得覆盖或削弱 [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md) 中的约定：
 
