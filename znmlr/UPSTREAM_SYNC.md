@@ -1,0 +1,130 @@
+# OpenMinis 个人 Fork 与上游同步约定
+
+## 仓库角色
+
+- 个人远端 `origin`：<https://github.com/yangyunzhao/OpenMinis.git>
+- 官方上游 `upstream`：<https://github.com/OpenMinis/OpenMinis.git>
+- 默认分支：`main`
+- 本地目录：`D:\repositories\OpenMinis`
+
+`origin` 用于保存个人修改和功能分支。`upstream` 只用于获取官方更新，本地已把它的 push URL 设置为 `DISABLED`，以避免误推。
+
+官方 `OpenMinis/OpenMinis` 是私有开发树的公开镜像，明确不接受 Pull Request。这个个人 fork 用于自行修改、构建和维护；功能建议应提交到官方 Issues，而不是向镜像仓库创建 PR。
+
+## 日常开发
+
+同步 `main` 后再创建功能分支：
+
+```powershell
+git switch main
+.\znmlr\Sync-Upstream.ps1
+git switch -c feature/<功能名称>
+```
+
+修改、验证并提交后，推送功能分支到个人远端：
+
+```powershell
+git add <明确的文件路径>
+git commit -m "<修改说明>"
+git push -u origin HEAD
+```
+
+除非有意维护个人发布版本，尽量不要直接在 `main` 上开发。把功能修改放在独立分支，可以让上游同步和冲突定位更清晰。
+
+## 同步官方更新
+
+在 PowerShell 中执行：
+
+```powershell
+git switch main
+.\znmlr\Sync-Upstream.ps1
+```
+
+脚本会依次：
+
+1. 拒绝在有未提交修改或非 `main` 分支时继续；
+2. 校验 `origin`，配置并保护 `upstream`；
+3. 获取个人远端 `main`；
+4. 获取并合并 `upstream/main`；
+5. 递归同步子模块，网络失败时自动重试；
+6. 将同步后的 `main` 推送到个人远端。
+
+首次运行 PowerShell 脚本若被执行策略阻止，可仅对当前窗口临时放行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\znmlr\Sync-Upstream.ps1
+```
+
+网络不稳定时可增加重试次数：
+
+```powershell
+.\znmlr\Sync-Upstream.ps1 -RetryCount 5 -RetryDelaySeconds 10
+```
+
+暂时不下载子模块或不推送远端：
+
+```powershell
+.\znmlr\Sync-Upstream.ps1 -SkipSubmodules
+.\znmlr\Sync-Upstream.ps1 -NoPush
+```
+
+GitHub HTTPS 下载在本机曾卡在默认传输连接上，因此脚本固定使用 HTTP/1.1。顶层子模块为 `deps/ish` 和 `deps/proot`；`deps/ish/deps/linux` 配置了 `update = none`，正常出现未初始化标记不代表同步失败。
+
+## 处理上游冲突
+
+Git 会自动合并互不冲突的修改。若你和上游改了同一段代码，脚本会停止并保留冲突现场，不会自动选择 `ours` 或 `theirs` 覆盖一方。
+
+查看冲突：
+
+```powershell
+git status
+git diff --name-only --diff-filter=U
+```
+
+处理方式：
+
+1. 逐个理解冲突两侧的意图，编辑文件并删除冲突标记；
+2. 执行与改动范围匹配的构建和测试；
+3. 标记已解决并完成合并：
+
+```powershell
+git add <已解决的文件>
+git commit
+git push origin main
+```
+
+如果暂时不处理，可恢复到合并前：
+
+```powershell
+git merge --abort
+```
+
+遇到不确定的代码冲突时，可以让 Codex 检查双方提交、调用关系和测试，再决定合并方式；不要仅根据冲突块的表面文本选择一侧。
+
+## 功能分支跟进最新 main
+
+`main` 同步完成后，在功能分支上执行：
+
+```powershell
+git switch feature/<功能名称>
+git rebase main
+```
+
+如果功能分支已经由多人使用或不希望改写提交历史，可以改用：
+
+```powershell
+git merge main
+```
+
+解决冲突并验证后，再推送到个人远端。对已经推送且只有自己使用的 rebase 分支，应使用：
+
+```powershell
+git push --force-with-lease
+```
+
+不要使用 `--force`。
+
+## 许可证提醒
+
+OpenMinis 使用 GPLv3。可以 fork、修改和自行构建；如果分发修改后的程序，需要按 GPLv3 提供对应源码并继续使用 GPLv3。
