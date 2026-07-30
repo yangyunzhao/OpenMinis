@@ -36,8 +36,13 @@ android {
         applicationId = "com.openminis.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 20
-        versionName = "0.20-preview"
+        // 个人发布版本号采用“上游 versionCode × 1000 + 个人发布序号”。
+        // 例如：上游 0.20 的 versionCode 为 20，本次个人第 1 版使用 20001；
+        // 后续个人修订依次使用 20002、20003，上游升级到 0.21 后则从 21001 开始。
+        // 这样既能追溯对应的上游数字版本，也能保证 Android 覆盖安装要求的
+        // versionCode 持续单调递增，避免与后续上游构建号发生碰撞。
+        versionCode = 20001
+        versionName = "0.20-preview-znmlr.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
