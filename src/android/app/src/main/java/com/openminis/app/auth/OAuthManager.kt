@@ -4,19 +4,216 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+private const val OAUTH_REFRESH_WINDOW_MILLIS = 4L * 60 * 60 * 1000
+
+/**
+ * 现有 OAuth 自动刷新路径的纯决策核心。
+ *
+ * Android 凭据存储只通过窄回调注入，因此可用设备码生成的真实 JSON 形状在纯 JVM
+ * 中验证。刷新失败时只在旧 Token 已经过期后清理；仍有效的旧 Token 可以继续使用。
+ */
+internal suspend fun resolveValidOAuthAccessToken(
+    stored: JSONObject?,
+    nowEpochMillis: Long,
+    refresh: suspend () -> Boolean,
+    reload: () -> JSONObject?,
+    clearCredentials: () -> Unit,
+    refreshMutex: Mutex? = null,
+): String? {
+    if (refreshMutex != null) {
+        return refreshMutex.withLock {
+            val latest = reload()
+            val snapshotChanged =
+                stored?.optString("access_token", "") != latest?.optString("access_token", "") ||
+                    stored?.optString("refresh_token", "") != latest?.optString("refresh_token", "") ||
+                    stored?.optLong("expire_at", 0) != latest?.optLong("expire_at", 0)
+            if (snapshotChanged) {
+                return@withLock latest
+                    ?.optString("access_token", "")
+                    ?.takeIf { it.isNotEmpty() }
+            }
+            resolveValidOAuthAccessToken(
+                stored = latest,
+                nowEpochMillis = nowEpochMillis,
+                refresh = refresh,
+                reload = reload,
+                clearCredentials = clearCredentials,
+            )
+        }
+    }
+
+    val token = stored
+        ?.optString("access_token", "")
+        ?.takeIf { it.isNotEmpty() }
+        ?: return null
+    val refreshToken = stored
+        .optString("refresh_token", "")
+        .takeIf { it.isNotEmpty() }
+    val expireAt = stored.optLong("expire_at", 0)
+
+    if (expireAt > 0 && expireAt - nowEpochMillis < OAUTH_REFRESH_WINDOW_MILLIS) {
+        if (refresh()) {
+            return reload()
+                ?.optString("access_token", "")
+                ?.takeIf { it.isNotEmpty() }
+        }
+        if (nowEpochMillis >= expireAt) {
+            // 另一个并发刷新可能已用同一旧 refresh token 成功并写入新 access token。
+            // 失败调用只能清理自己观察到的旧快照，不能删除刚写入的新凭据。
+            val latest = reload()
+            val latestToken = latest
+                ?.optString("access_token", "")
+                ?.takeIf { it.isNotEmpty() }
+            val latestRefreshToken = latest
+                ?.optString("refresh_token", "")
+                ?.takeIf { it.isNotEmpty() }
+            if (latestToken != null &&
+                (latestToken != token ||
+                    latestRefreshToken != refreshToken ||
+                    latest.optLong("expire_at", 0) != expireAt)
+            ) {
+                return latestToken
+            }
+            clearCredentials()
+            return null
+        }
+    }
+    return token
+}
+
+/**
+ * 基础 OAuth refresh-token HTTP 核心。
+ *
+ * 只发送标准表单字段；响应必须为 2xx 且含非空 access_token。服务端省略或返回空的
+ * refresh_token 时保留旧值，省略 id_token 时也保留已有值，避免设备登录元数据因
+ * 一次普通 access-token 刷新丢失。函数不记录响应正文，也不吞协程取消。
+ */
+internal suspend fun refreshOAuthTokens(
+    stored: JSONObject,
+    tokenUrl: String,
+    clientId: String,
+    clientSecret: String?,
+    callFactory: Call.Factory,
+    nowEpochMillis: Long,
+    persist: (JSONObject) -> Unit,
+): Boolean = withContext(Dispatchers.IO) {
+    val oldRefreshToken = stored
+        .optString("refresh_token", "")
+        .takeIf { it.isNotEmpty() }
+        ?: return@withContext false
+
+    try {
+        val form = FormBody.Builder()
+            .add("grant_type", "refresh_token")
+            .add("refresh_token", oldRefreshToken)
+            .add("client_id", clientId)
+            .apply {
+                clientSecret?.let { add("client_secret", it) }
+            }
+            .build()
+        val request = Request.Builder()
+            .url(tokenUrl)
+            .post(form)
+            .build()
+
+        executeOAuthCall(callFactory, request).use { response ->
+            if (!response.isSuccessful) return@withContext false
+            val responseJson = runCatching {
+                JSONObject(response.body?.string().orEmpty())
+            }.getOrNull() ?: return@withContext false
+            if (responseJson.optString("access_token", "").isBlank()) {
+                return@withContext false
+            }
+
+            if (responseJson.optString("refresh_token", "").isBlank()) {
+                responseJson.put("refresh_token", oldRefreshToken)
+            }
+            if (responseJson.optString("id_token", "").isBlank()) {
+                stored.optString("id_token", "")
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { responseJson.put("id_token", it) }
+            }
+            val expiresInSeconds = responseJson.optLong("expires_in", 0)
+            if (expiresInSeconds > 0) {
+                val lifetimeMillis =
+                    if (expiresInSeconds > Long.MAX_VALUE / 1000L) {
+                        Long.MAX_VALUE
+                    } else {
+                        expiresInSeconds * 1000L
+                    }
+                val expireAt =
+                    if (lifetimeMillis == Long.MAX_VALUE ||
+                        nowEpochMillis > Long.MAX_VALUE - lifetimeMillis
+                    ) {
+                        Long.MAX_VALUE
+                    } else {
+                        nowEpochMillis + lifetimeMillis
+                    }
+                responseJson.put("expire_at", expireAt)
+            }
+            persist(responseJson)
+            true
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        false
+    }
+}
+
+/** 把 OkHttp Call 与协程取消绑定；取消刷新会立即关闭 socket，而不是等待网络超时。 */
+private suspend fun executeOAuthCall(
+    callFactory: Call.Factory,
+    request: Request,
+): Response = suspendCancellableCoroutine { continuation ->
+    val call = callFactory.newCall(request)
+    continuation.invokeOnCancellation { call.cancel() }
+    call.enqueue(
+        object : Callback {
+            override fun onFailure(call: Call, error: IOException) {
+                if (continuation.isActive) {
+                    continuation.resumeWithException(error)
+                }
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                if (continuation.isActive) {
+                    continuation.resume(response) { _, cancelledResponse, _ ->
+                        cancelledResponse.close()
+                    }
+                } else {
+                    response.close()
+                }
+            }
+        },
+    )
+}
 
 abstract class OAuthManager(
     protected val context: Context,
@@ -25,6 +222,28 @@ abstract class OAuthManager(
     companion object {
         private const val TAG = "OAuthManager"
         private const val KEY_MANUAL_BEARER = "manual_bearer_token"
+        private val SENSITIVE_BODY_FIELDS = setOf(
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "api_key",
+            "key",
+            "client_secret",
+            "device_code",
+            "user_code",
+            "device_auth_id",
+            "authorization_code",
+            "code_verifier",
+            "code_challenge",
+        )
+        private val SENSITIVE_BODY_KEY_PATTERN = Regex(
+            "\"(?:${SENSITIVE_BODY_FIELDS.joinToString("|")})\"\\s*:",
+            RegexOption.IGNORE_CASE,
+        )
+        private val SENSITIVE_FORM_FIELD_PATTERN = Regex(
+            "(^|[&?\\s])(${SENSITIVE_BODY_FIELDS.joinToString("|")})=([^&\\s]*)",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE),
+        )
 
         /** Shared OkHttp client for all OAuth HTTP requests (respects system proxy). */
         internal val httpClient = OkHttpClient.Builder()
@@ -33,20 +252,106 @@ abstract class OAuthManager(
             .build()
 
         /**
+         * 同一 Provider 实例的 access-token 判定与自动刷新必须串行。
+         *
+         * 多个并发请求可能同时发现 Token 已过期；实例级 Mutex 让第一个请求负责网络刷新，
+         * 后续请求进入临界区后重新读取已落盘快照，从而避免重复刷新，也避免失败请求在
+         * “复核旧快照”和“清理凭据”之间误删另一个请求刚写入的新 Token。
+         */
+        private val refreshMutexes = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+
+        private fun refreshMutexFor(instanceId: String): Mutex =
+            refreshMutexes.getOrPut(instanceId) { Mutex() }
+
+        /**
          * [T-android-oauth-log-redaction] Make an HTTP body safe to log:
-         * masks the VALUES of known credential fields (access_token,
-         * refresh_token, id_token, api_key/key, client_secret, device_code)
-         * and truncates to a diagnostic-sized prefix. OAuth failure bodies
-         * are usually just {"error":"invalid_grant"} — but some IdPs echo
-         * request material, and a malformed SUCCESS body reaching an error
-         * path would otherwise dump live credentials into logcat / the
-         * on-device log files.
+         * masks the VALUES of known credential fields and truncates to a
+         * diagnostic-sized prefix. Besides normal OAuth tokens, the list
+         * deliberately includes every secret used by the OpenAI device-code
+         * flow: the short user code, device authorization id, authorization
+         * code, and both halves of the PKCE exchange. OAuth failure bodies are
+         * usually just {"error":"invalid_grant"} — but some IdPs echo request
+         * material, and a malformed SUCCESS body reaching an error path would
+         * otherwise dump live credentials into logcat / the on-device logs.
+         *
+         * Valid JSON is traversed recursively, so a sensitive key is replaced
+         * regardless of whether its value is a string, primitive, object or
+         * array. If parsing fails but a sensitive-looking key is present, the
+         * complete body is withheld instead of trying to recover individual
+         * values with a partial regular expression. Key matching is
+         * case-insensitive so capitalization cannot bypass redaction.
          */
         fun sanitizeBody(body: String, maxLen: Int = 300): String {
-            val masked = Regex(
-                "\"(access_token|refresh_token|id_token|api_key|key|client_secret|device_code)\"\\s*:\\s*\"[^\"]*\"",
-            ).replace(body) { m -> "\"${m.groupValues[1]}\":\"***\"" }
+            val trimmed = body.trim()
+            val masked = try {
+                when {
+                    trimmed.startsWith("{") -> sanitizeJsonObject(JSONObject(trimmed)).toString()
+                    trimmed.startsWith("[") -> sanitizeJsonArray(JSONArray(trimmed)).toString()
+                    else -> sanitizeNonJsonBody(body)
+                }
+            } catch (_: Exception) {
+                sanitizeNonJsonBody(body)
+            }
             return if (masked.length <= maxLen) masked else masked.take(maxLen) + "…(${masked.length} chars)"
+        }
+
+        private fun sanitizeNonJsonBody(body: String): String {
+            if (SENSITIVE_BODY_KEY_PATTERN.containsMatchIn(body)) {
+                return "<redacted OAuth body: ${body.length} chars>"
+            }
+            return SENSITIVE_FORM_FIELD_PATTERN.replace(body) { match ->
+                "${match.groupValues[1]}${match.groupValues[2]}=***"
+            }
+        }
+
+        private fun sanitizeJsonObject(source: JSONObject): JSONObject {
+            val sanitized = JSONObject()
+            source.keys().forEach { key ->
+                val value = source.get(key)
+                sanitized.put(
+                    key,
+                    if (key.lowercase() in SENSITIVE_BODY_FIELDS) {
+                        "***"
+                    } else {
+                        sanitizeJsonValue(value)
+                    },
+                )
+            }
+            return sanitized
+        }
+
+        private fun sanitizeJsonArray(source: JSONArray): JSONArray {
+            val sanitized = JSONArray()
+            for (index in 0 until source.length()) {
+                sanitized.put(sanitizeJsonValue(source.get(index)))
+            }
+            return sanitized
+        }
+
+        private fun sanitizeJsonValue(value: Any?): Any? = when (value) {
+            is JSONObject -> sanitizeJsonObject(value)
+            is JSONArray -> sanitizeJsonArray(value)
+            else -> value
+        }
+
+        /**
+         * Return every encrypted OAuth preference key owned by one provider
+         * instance. Keeping this mapping in one pure helper makes deletion
+         * testable without an Android keystore and prevents a future caller
+         * from clearing a similarly named key belonging to another instance.
+         */
+        internal fun credentialPreferenceKeys(
+            instanceId: String,
+            additionalKeyNames: Set<String> = emptySet(),
+        ): Set<String> {
+            val keys = linkedSetOf(
+                "oauth_tokens_$instanceId",
+                "oauth_${KEY_MANUAL_BEARER}_$instanceId",
+            )
+            additionalKeyNames.forEach { keyName ->
+                keys += "oauth_${keyName}_$instanceId"
+            }
+            return keys
         }
 
         /** Create the appropriate OAuthManager for a provider instance. */
@@ -68,6 +373,14 @@ abstract class OAuthManager(
     abstract val callbackPort: Int
     abstract val redirectPath: String
     abstract val scopes: String
+
+    /**
+     * Provider-specific encrypted fields that belong to this instance in
+     * addition to the common token blob and optional manual bearer token.
+     * Subclasses list logical names only; [logout] applies the instance suffix
+     * centrally so cleanup cannot accidentally cross provider boundaries.
+     */
+    protected open val additionalCredentialKeyNames: Set<String> = emptySet()
 
     // `open` so a provider whose server-side allow-list pins a different
     // loopback spelling can override it (xAI registered 127.0.0.1, not
@@ -204,67 +517,37 @@ abstract class OAuthManager(
 
     open suspend fun refreshToken(): Boolean = withContext(Dispatchers.IO) {
         val stored = loadStoredTokens() ?: return@withContext false
-        val refreshToken = stored.optString("refresh_token", "").ifEmpty { return@withContext false }
-
-        try {
-            val params = mutableMapOf(
-                "grant_type" to "refresh_token",
-                "refresh_token" to refreshToken,
-                "client_id" to clientId,
-            )
-            clientSecret?.let { params["client_secret"] = it }
-
-            val formBody = params.entries.joinToString("&") { "${it.key}=${Uri.encode(it.value)}" }
-            val request = Request.Builder()
-                .url(tokenURL)
-                .post(formBody.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
-                .build()
-            val response = httpClient.newCall(request).execute()
-            val responseCode = response.code
-            val responseBody = response.body?.string() ?: ""
-            response.close()
-
-            if (responseCode !in 200..299) {
-                Log.e(TAG, "Token refresh failed: $responseCode")
-                return@withContext false
-            }
-
-            val json = JSONObject(responseBody)
-            // Preserve refresh_token if not returned
-            if (!json.has("refresh_token")) {
-                json.put("refresh_token", refreshToken)
-            }
-            saveTokens(json)
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Token refresh error", e)
-            false
+        val refreshed = refreshOAuthTokens(
+            stored = stored,
+            tokenUrl = tokenURL,
+            clientId = clientId,
+            clientSecret = clientSecret,
+            callFactory = httpClient,
+            nowEpochMillis = System.currentTimeMillis(),
+            persist = ::saveTokenSnapshot,
+        )
+        if (!refreshed) {
+            Log.e(TAG, "Token refresh failed")
         }
+        refreshed
     }
 
-    open suspend fun validAccessToken(): String? {
+    open suspend fun validAccessToken(): String? = withContext(Dispatchers.IO) {
         // Manual bearer token takes precedence — user wants a static token,
         // no refresh attempted. Mirrors iOS behavior for custom proxy providers.
-        loadManualBearerToken()?.takeIf { it.isNotEmpty() }?.let { return it }
+        loadManualBearerToken()?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
 
-        val stored = loadStoredTokens() ?: return null
-        val token = stored.optString("access_token", "").ifEmpty { return null }
-        val expireAt = stored.optLong("expire_at", 0)
-        val now = System.currentTimeMillis()
-
-        // Refresh if expires within 4 hours
-        if (expireAt > 0 && (expireAt - now) < 4 * 3600 * 1000) {
-            if (refreshToken()) {
-                return loadStoredTokens()?.optString("access_token")
-            }
-            // Refresh failed — if token is already expired, clear credentials
-            if (expireAt > 0 && now >= expireAt) {
+        resolveValidOAuthAccessToken(
+            stored = loadStoredTokens(),
+            nowEpochMillis = System.currentTimeMillis(),
+            refresh = ::refreshToken,
+            reload = ::loadStoredTokens,
+            clearCredentials = {
                 Log.w(TAG, "Token expired and refresh failed — clearing credentials")
                 logout()
-                return null
-            }
-        }
-        return token
+            },
+            refreshMutex = refreshMutexFor(instanceId),
+        )
     }
 
     fun isAuthenticated(): Boolean {
@@ -274,10 +557,10 @@ abstract class OAuthManager(
     }
 
     fun logout() {
-        getEncryptedPrefs().edit()
-            .remove("oauth_tokens_$instanceId")
-            .remove("oauth_${KEY_MANUAL_BEARER}_$instanceId")
-            .apply()
+        val editor = getEncryptedPrefs().edit()
+        credentialPreferenceKeys(instanceId, additionalCredentialKeyNames)
+            .forEach(editor::remove)
+        editor.apply()
     }
 
     // Token storage
@@ -286,6 +569,13 @@ abstract class OAuthManager(
         if (expiresIn > 0) {
             json.put("expire_at", System.currentTimeMillis() + expiresIn * 1000)
         }
+        getEncryptedPrefs().edit()
+            .putString("oauth_tokens_$instanceId", json.toString())
+            .apply()
+    }
+
+    /** 保存已经计算好绝对 expire_at 的刷新快照，不再使用第二次时钟重算。 */
+    private fun saveTokenSnapshot(json: JSONObject) {
         getEncryptedPrefs().edit()
             .putString("oauth_tokens_$instanceId", json.toString())
             .apply()
@@ -302,6 +592,26 @@ abstract class OAuthManager(
 
     protected fun loadOAuthString(key: String): String? {
         return getEncryptedPrefs().getString("oauth_${key}_$instanceId", null)
+    }
+
+    /**
+     * 设备码 Provider 一致性提交使用的同步写入边界。
+     *
+     * 普通 OAuth 流程继续使用既有 apply() 行为；只有需要确认落盘结果的设备码提交
+     * 才调用这里。所有 key 都会自动限定到当前 instance ID。
+     */
+    protected fun commitOAuthSnapshot(
+        values: Map<String, String>,
+        removeKeyNames: Set<String> = emptySet(),
+    ): Boolean {
+        val editor = getEncryptedPrefs().edit()
+        removeKeyNames.forEach { key ->
+            editor.remove("oauth_${key}_$instanceId")
+        }
+        values.forEach { (key, value) ->
+            editor.putString("oauth_${key}_$instanceId", value)
+        }
+        return editor.commit()
     }
 
     /**

@@ -3,6 +3,14 @@ package com.openminis.app.data.repository
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
+import com.openminis.app.auth.OAuthManager
+import com.openminis.app.auth.OpenAIDevicePendingCommitStage
+import com.openminis.app.auth.OpenAIDeviceProviderCommitStore
+import com.openminis.app.auth.OpenAIDeviceRecoveryAction
+import com.openminis.app.auth.OpenAIDeviceRecoveryProviderKind
+import com.openminis.app.auth.OpenAIDeviceTokens
+import com.openminis.app.auth.OpenAIOAuthManager
+import com.openminis.app.auth.decideOpenAIDeviceRecoveryAction
 import com.openminis.app.data.db.ProviderConfigDao
 import com.openminis.app.data.db.ProviderConfigMetaKeys
 import com.openminis.app.data.db.ProviderConfigSnapshot
@@ -39,6 +47,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.serialization.json.Json
 
 // Modality bit layout — must match src/ios/Providers/LLMTypes.swift
@@ -54,7 +63,31 @@ private const val MODALITY_BIT_IMG_OUT = 1 shl 6
 private const val MODALITY_BIT_AUD_OUT = 1 shl 7
 private const val MODALITY_BIT_VID_OUT = 1 shl 8
 
-class ProviderRepository(private val context: Context) {
+/**
+ * Remove every credential namespace owned by a deleted provider instance.
+ *
+ * The callbacks keep the decision logic independently testable: production
+ * supplies Android encrypted stores, while JVM tests supply in-memory sets.
+ * API-key cleanup always runs, including for a stale id whose config row has
+ * already disappeared. OAuth cleanup is intentionally limited to official
+ * OpenAI OAuth instances so deleting an API-key or compatible-endpoint
+ * provider cannot touch an unrelated OAuth namespace.
+ */
+internal fun clearRemovedProviderCredentials(
+    instanceId: String,
+    removedInstance: ProviderInstance?,
+    clearOAuthCredentials: (ProviderInstance) -> Unit,
+    clearApiKey: (String) -> Unit,
+) {
+    if (removedInstance?.providerType == ProviderType.openAI &&
+        removedInstance.credentialType == ProviderCredential.oauth
+    ) {
+        clearOAuthCredentials(removedInstance)
+    }
+    clearApiKey(instanceId)
+}
+
+class ProviderRepository(private val context: Context) : OpenAIDeviceProviderCommitStore {
 
     // [T-android-thinking-level-arch] coerceInputValues makes kotlinx.serialization
     // fall back to a property's DEFAULT when it can't decode the wire value —
@@ -74,6 +107,22 @@ class ProviderRepository(private val context: Context) {
     }
 
     private val prefs: SharedPreferences = context.getSharedPreferences("provider_config", Context.MODE_PRIVATE)
+
+    /**
+     * 设备登录提交日志与普通配置、加密凭据完全分离。值只有阶段名，key 只有随机
+     * instance ID；绝不写入标签、设备码或 Token。
+     */
+    private val openAIDeviceCommitPrefs: SharedPreferences =
+        context.getSharedPreferences("openai_device_provider_commits", Context.MODE_PRIVATE)
+
+    /**
+     * Provider 结构变更与设备登录跨存储提交共用的进程内互斥。
+     *
+     * 设备登录在持锁期间只做本地 Room/SharedPreferences 写入和 generation 握手；
+     * 可能访问网络的模型刷新在释放锁后执行。这样普通增删改无法插入
+     * “Provider 已发布、凭据尚未写入”的半提交窗口。
+     */
+    private val providerMutationMutex = Mutex()
 
     // [T-android-provider-room-store] Per-row provider config DB. Lives in
     // its own provider.db file so a downgrade to a build that doesn't know
@@ -186,26 +235,48 @@ class ProviderRepository(private val context: Context) {
 
     init {
         loadScope.launch {
-            val loaded = loadConfig()
-            synchronized(configLock) {
-                // Only adopt the disk config if nothing has written in the
-                // meantime. A write during the load window (rare — writes come
-                // from user/refresh actions that themselves need config) flips
-                // _configLoaded true and takes precedence; we must not clobber
-                // it with the stale on-disk snapshot.
-                if (!_configLoaded.value) {
-                    _config.value = loaded
-                    _configLoaded.value = true
+            var loaded: ProviderConfig? = null
+            try {
+                val baseConfig = loadConfig()
+                // 必须在首次向 UI 发布配置前恢复半提交事务，避免崩溃后短暂展示一个
+                // 没有完整凭据的 Provider。
+                // 如果 marker 存储整体不可读，不能绕过恢复直接发布可能包含半提交
+                // Provider 的 baseConfig。让外层按“配置不可用”失败关闭，避免后续写入
+                // 用一个未经恢复的快照覆盖用户数据；下次冷启动仍会保留并重试 marker。
+                loaded = recoverPendingOpenAIDeviceCommits(baseConfig)
+            } catch (_: Exception) {
+                android.util.Log.e(
+                    "ProviderRepo",
+                    "[ProviderStore] initial config load failed",
+                )
+            } finally {
+                val authoritative = loaded
+                if (authoritative != null) {
+                    synchronized(configLock) {
+                        _config.value = authoritative
+                        _configLoaded.value = true
+                    }
+                    if (!configLoadComplete.isCompleted) {
+                        configLoadComplete.complete(Unit)
+                    }
+                } else if (!configLoadComplete.isCompleted) {
+                    // 基础配置读取失败时绝不能把空占位当成真实“首次安装”配置，否则
+                    // 任一后续 mutator 都可能用空快照覆盖用户原数据。所有写入口失败
+                    // 关闭，等待下次进程启动重新读取。
+                    configLoadComplete.completeExceptionally(
+                        IllegalStateException("Provider config is unavailable"),
+                    )
                 }
             }
-            if (!configLoadComplete.isCompleted) configLoadComplete.complete(Unit)
             // [T-android-provider-voice] Reconcile voice-template seeds after
             // the initial load (add new template models, drop retired seeds,
             // heal corrupted modality). Mirrors iOS ProviderConfigStore.init.
-            try {
-                ensureVoiceTemplateModels()
-            } catch (e: Exception) {
-                android.util.Log.w("ProviderRepo", "[Voice] ensureVoiceTemplateModels failed: ${e.message}")
+            if (_configLoaded.value) {
+                try {
+                    ensureVoiceTemplateModels()
+                } catch (e: Exception) {
+                    android.util.Log.w("ProviderRepo", "[Voice] ensureVoiceTemplateModels failed: ${e.message}")
+                }
             }
         }
     }
@@ -380,13 +451,27 @@ class ProviderRepository(private val context: Context) {
      * authoritative state — using the in-memory pre-call object would
      * leak the legacy uuid form into [_config.value].
      */
-    private suspend fun persistToDbAndMirror(config: ProviderConfig): ProviderConfig {
+    /**
+     * DB 已提交但 JSON mirror 的同步 commit 失败。异常携带不含凭据的规范化配置，
+     * 让严格事务能够立即对齐内存后补偿，而不是误以为 DB 没有发生写入。
+     */
+    private class MirrorCommitException(
+        val canonicalConfig: ProviderConfig,
+    ) : IllegalStateException("Provider JSON mirror commit failed")
+
+    private suspend fun persistToDbAndMirror(
+        config: ProviderConfig,
+        requireMirror: Boolean = false,
+    ): ProviderConfig {
         // First serialize without the hash so the meta row reflects the
         // exact string we put into prefs (the hash sees the mirror that
         // older builds will read, not a hash-of-itself).
         val mirrorStr = json.encodeToString(ProviderConfig.serializer(), config)
         val mirrorHash = hashJsonMirror(mirrorStr)
         val snapshot = config.toSnapshot(json, jsonSyncHash = mirrorHash)
+        // 规范化也可能抛异常，必须在 Room 写入前完成。这样一旦 replaceAll 成功，
+        // 后续唯一可能失败的步骤只剩 mirror commit，严格事务就总能携带准确状态补偿。
+        val canonical = snapshot.toProviderConfig(json)
         providerDao.replaceAll(
             instances = snapshot.instances,
             entries = snapshot.entries,
@@ -412,7 +497,14 @@ class ProviderRepository(private val context: Context) {
         // the dbConfig-fallback at the end of loadConfigSuspending keeps
         // the DB rows when re-import fails or is rejected, so the user's
         // data is not lost.
-        val mirrorWritten = prefs.edit().putString("config", mirrorStr).commit()
+        val mirrorWritten = try {
+            prefs.edit().putString("config", mirrorStr).commit()
+        } catch (failure: Exception) {
+            if (requireMirror) {
+                throw MirrorCommitException(canonical)
+            }
+            throw failure
+        }
         if (!mirrorWritten) {
             android.util.Log.w(
                 "ProviderRepo",
@@ -423,7 +515,10 @@ class ProviderRepository(private val context: Context) {
         }
         // Return canonicalized form so the caller's _config.value reflects
         // entry uuids in composite-key shape from this write forward.
-        return snapshot.toProviderConfig(json)
+        if (!mirrorWritten && requireMirror) {
+            throw MirrorCommitException(canonical)
+        }
+        return canonical
     }
 
     /**
@@ -432,17 +527,13 @@ class ProviderRepository(private val context: Context) {
      * caller's thread) before the mutator reads `_config.value`. Without this a
      * write that lands during the startup load window would read the empty
      * placeholder, mutate it, and persist — WIPING the user's real config.
-     * Idempotent and cheap once loaded (just a volatile read). Synchronized on
-     * [configLock] so it can't race the async loader's emit.
+     * Idempotent and cheap once loaded (just a volatile read). Initial loading
+     * and device-transaction recovery are single-flight: early mutators wait
+     * for the background loader instead of launching a second DB reconciliation.
      */
     private fun ensureConfigLoaded() {
         if (_configLoaded.value) return
-        synchronized(configLock) {
-            if (_configLoaded.value) return
-            _config.value = loadConfig()
-            _configLoaded.value = true
-        }
-        if (!configLoadComplete.isCompleted) configLoadComplete.complete(Unit)
+        runBlocking { configLoadComplete.await() }
     }
 
     private fun saveConfig(config: ProviderConfig) {
@@ -495,11 +586,387 @@ class ProviderRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Phase 4 专用严格入口：任一持久层写入失败都向上传递，供设备登录事务补偿。
+     * 普通设置页面继续使用 [saveConfig] 的历史 fire-and-forget 行为。
+     */
+    private fun saveConfigStrict(config: ProviderConfig) {
+        synchronized(configLock) {
+            val canonical = try {
+                runBlocking {
+                    persistToDbAndMirror(
+                        config = config,
+                        requireMirror = true,
+                    )
+                }
+            } catch (mirrorFailure: MirrorCommitException) {
+                // DB 已落盘，因此先把内存对齐到实际状态；随后仍抛错，让提交器清理
+                // Provider、DB、mirror 与凭据。
+                emitConfig(mirrorFailure.canonicalConfig, config.revision + 1)
+                throw mirrorFailure
+            }
+            emitConfig(canonical, config.revision + 1)
+        }
+    }
+
+    private fun emitConfig(
+        config: ProviderConfig,
+        revision: Long,
+    ) {
+        _config.value = config.copy(
+            instances = config.instances.toMutableList(),
+            modelEntries = config.modelEntries.toMutableList(),
+            modelGroups = config.modelGroups.toMutableList(),
+            agentLoopModelEntryIds = config.agentLoopModelEntryIds.toMutableList(),
+            agentLoopGroupIds = config.agentLoopGroupIds.toMutableList(),
+            revision = revision,
+        )
+    }
+
+    /** 复制可变集合外壳，避免严格事务提前改动已经发布到 StateFlow 的对象。 */
+    private fun mutableConfigCopy(config: ProviderConfig): ProviderConfig =
+        config.copy(
+            instances = config.instances.toMutableList(),
+            modelEntries = config.modelEntries.toMutableList(),
+            modelGroups = config.modelGroups.toMutableList(),
+            agentLoopModelEntryIds = config.agentLoopModelEntryIds.toMutableList(),
+            agentLoopGroupIds = config.agentLoopGroupIds.toMutableList(),
+        )
+
+    override suspend fun <T> withProviderTransaction(
+        instanceId: String,
+        block: suspend () -> T,
+    ): T {
+        require(instanceId.isNotBlank())
+        providerMutationMutex.lock()
+        return try {
+            block()
+        } finally {
+            providerMutationMutex.unlock()
+        }
+    }
+
+    /**
+     * 兼容现有同步设置 API 的互斥适配器。等待只可能发生在另一个本地设备登录提交
+     * 的短事务窗口；不要在 [block] 内执行网络请求，也不要嵌套调用本函数。
+     */
+    private inline fun <T> withProviderMutationLock(block: () -> T): T {
+        runBlocking { providerMutationMutex.lock() }
+        return try {
+            block()
+        } finally {
+            providerMutationMutex.unlock()
+        }
+    }
+
+    override suspend fun writePendingMarker(
+        instanceId: String,
+        stage: OpenAIDevicePendingCommitStage,
+    ) {
+        require(instanceId.isNotBlank())
+        // 首个 PREPARED marker 只能写在冷启动恢复完成之后，否则后台恢复可能把一笔
+        // 正在进行的新事务当成上次崩溃残留并提前消费。
+        awaitConfigLoaded()
+        if (!openAIDeviceCommitPrefs.edit().putString(instanceId, stage.name).commit()) {
+            throw IllegalStateException("OpenAI device commit marker write failed")
+        }
+    }
+
+    override suspend fun clearPendingMarker(instanceId: String) {
+        require(instanceId.isNotBlank())
+        if (!openAIDeviceCommitPrefs.edit().remove(instanceId).commit()) {
+            throw IllegalStateException("OpenAI device commit marker clear failed")
+        }
+    }
+
+    override suspend fun saveProviderStrict(instance: ProviderInstance) {
+        require(isOfficialOpenAIDeviceProvider(instance))
+        ensureConfigLoaded()
+        synchronized(configLock) {
+            check(_config.value.instances.none { it.id == instance.id }) {
+                "Provider instance already exists"
+            }
+            val next = mutableConfigCopy(_config.value)
+            next.instances.add(instance)
+            next.modelEntries.addAll(
+                ProviderType.openAI.builtInModels.map { model ->
+                    ModelEntry(
+                        providerInstanceId = instance.id,
+                        baseModel = model,
+                    )
+                },
+            )
+            saveConfigStrict(next)
+        }
+        invalidateModelCache(instance.id)
+    }
+
+    override suspend fun saveCredentialsStrict(
+        instanceId: String,
+        tokens: OpenAIDeviceTokens,
+    ) {
+        require(instanceId.isNotBlank())
+        val oauthManager = OpenAIOAuthManager(context, instanceId)
+        if (!oauthManager.commitDeviceTokens(tokens)) {
+            throw IllegalStateException("OpenAI OAuth credential commit failed")
+        }
+        if (!encryptedPrefs.edit().putString("apikey_$instanceId", tokens.accessToken).commit()) {
+            throw IllegalStateException("OpenAI API credential mirror commit failed")
+        }
+    }
+
+    override suspend fun verifyProviderStrict(instance: ProviderInstance) {
+        ensureConfigLoaded()
+        synchronized(configLock) {
+            val persisted = _config.value.instances.firstOrNull { it.id == instance.id }
+            check(persisted == instance) {
+                "OpenAI device commit target changed before final confirmation"
+            }
+            check(isOfficialOpenAIDeviceProvider(persisted))
+        }
+    }
+
+    /**
+     * 清理事务写入的 Provider 与两份凭据。即使其中一侧失败也继续尝试另一侧，调用者
+     * 会在存在任一失败时保留 marker，供下次启动继续补偿。
+     */
+    override suspend fun rollbackStrict(instanceId: String) {
+        require(instanceId.isNotBlank())
+        ensureConfigLoaded()
+        var firstFailure: Throwable? = null
+
+        val existing = synchronized(configLock) {
+            _config.value.instances.firstOrNull { it.id == instanceId }
+        }
+        if (existing != null && !isOfficialOpenAIDeviceProvider(existing)) {
+            throw IllegalStateException("Pending marker points to unrelated provider")
+        }
+
+        runCatching {
+            check(OpenAIOAuthManager(context, instanceId).clearDeviceCredentialsStrict())
+        }.onFailure { failure ->
+            // 记录后继续清理 API mirror 与 Provider 配置。
+            firstFailure = firstFailure ?: failure
+        }
+        runCatching {
+            check(encryptedPrefs.edit().remove("apikey_$instanceId").commit())
+        }.onFailure { failure ->
+            firstFailure = firstFailure ?: failure
+        }
+
+        // 即使内存中没看到目标，也要重写当前完整配置。DB 可能已经成功保存 Provider，
+        // 但 mirror/规范化异常发生在 StateFlow 发射前；此写入才能删除 DB 孤儿。
+        runCatching {
+            synchronized(configLock) {
+                val next = configWithoutProvider(_config.value, instanceId)
+                saveConfigStrict(next)
+            }
+        }.onFailure { failure ->
+            // 持久层补偿失败时 marker 会保留供下次冷启动重试，但当前进程也必须立即
+            // 隐藏已经由 saveProviderStrict 发布的半提交 Provider。否则设置页会在“未
+            // 保存登录”的同时继续展示一个没有完整凭据的可选 Provider。
+            synchronized(configLock) {
+                val hidden = configWithoutProvider(_config.value, instanceId)
+                emitConfig(hidden, _config.value.revision + 1)
+            }
+            firstFailure = firstFailure ?: failure
+        }
+        invalidateModelCache(instanceId)
+        firstFailure?.let { throw it }
+    }
+
+    override suspend fun applyOpenAIOAuthModels(instance: ProviderInstance) {
+        require(
+            instance.providerType == ProviderType.openAI &&
+                instance.credentialType == ProviderCredential.oauth,
+        )
+        val models = OpenAIModelsApi.fetchModelsOAuth()
+        check(models.isNotEmpty()) { "OpenAI OAuth model list is empty" }
+        replaceEntries(instance.id, models)
+    }
+
+    private fun isOfficialOpenAIDeviceProvider(instance: ProviderInstance): Boolean =
+        instance.providerType == ProviderType.openAI &&
+            instance.credentialType == ProviderCredential.oauth &&
+            instance.customBaseURL == null
+
+    private fun configWithoutProvider(
+        source: ProviderConfig,
+        instanceId: String,
+    ): ProviderConfig {
+        val removedEntryIds = source.modelEntries
+            .filter { it.providerInstanceId == instanceId }
+            .mapTo(mutableSetOf()) { it.id }
+        val newlyEmptyGroupIds = source.modelGroups
+            .filter { group ->
+                group.memberEntryIds.any { it in removedEntryIds } &&
+                    group.memberEntryIds.all { it in removedEntryIds }
+            }
+            .mapTo(mutableSetOf()) { it.id }
+        return mutableConfigCopy(source).copy(
+            instances = source.instances
+                .filterNot { it.id == instanceId }
+                .toMutableList(),
+            modelEntries = source.modelEntries
+                .filterNot { it.providerInstanceId == instanceId }
+                .toMutableList(),
+            modelGroups = source.modelGroups.map { group ->
+                group.copy(
+                    memberEntryIds = group.memberEntryIds
+                        .filterNot { it in removedEntryIds }
+                        .toMutableList(),
+                )
+            }.toMutableList(),
+            agentLoopModelEntryIds = source.agentLoopModelEntryIds
+                .filterNot { it in removedEntryIds }
+                .toMutableList(),
+        ).also { config ->
+            // 不清理早已存在的空组，只级联删除确实因本 Provider 被回滚而变空的组。
+            config.modelGroups.removeAll { it.id in newlyEmptyGroupIds }
+            config.agentLoopGroupIds.removeAll { it in newlyEmptyGroupIds }
+            if (config.defaultPrimaryGroupId in newlyEmptyGroupIds) {
+                config.defaultPrimaryGroupId = null
+            }
+            if (config.defaultSubGroupId in newlyEmptyGroupIds) {
+                config.defaultSubGroupId = null
+            }
+            if (config.voiceInputGroupId in newlyEmptyGroupIds) {
+                config.voiceInputGroupId = null
+            }
+            if (config.voiceOutputGroupId in newlyEmptyGroupIds) {
+                config.voiceOutputGroupId = null
+            }
+        }
+    }
+
+    /**
+     * 冷启动幂等恢复。COMMIT_CONFIRMED 只有在 Provider 与两份凭据完整且互相匹配
+     * 时才最终保留；损坏 marker 若指向其他 Provider，只清 marker，绝不碰用户数据。
+     */
+    private suspend fun recoverPendingOpenAIDeviceCommits(
+        loaded: ProviderConfig,
+    ): ProviderConfig {
+        var recovered = mutableConfigCopy(loaded)
+        val markers = openAIDeviceCommitPrefs.all
+            .mapValues { (_, value) -> value as? String }
+        if (markers.isEmpty()) return recovered
+
+        for ((instanceId, rawStage) in markers) {
+            recovered = try {
+                recoverOneOpenAIDeviceCommit(
+                    source = recovered,
+                    instanceId = instanceId,
+                    rawMarker = rawStage,
+                )
+            } catch (_: Exception) {
+                // 单笔恢复失败时保留 marker 供下次冷启动重试。若它指向本功能创建的
+                // 官方 OpenAI OAuth Provider，本次内存快照也必须隐藏该 Provider，
+                // 不能先向 UI 暴露一个凭据完整性尚未验证的半成品。这里不做持久删除，
+                // 因而瞬时磁盘/Keystore 故障恢复后仍可按 marker 幂等收尾。
+                android.util.Log.w(
+                    "ProviderRepo",
+                    "[OpenAIDeviceCommit] one pending recovery deferred",
+                )
+                val pending = recovered.instances.firstOrNull { it.id == instanceId }
+                if (pending != null && isOfficialOpenAIDeviceProvider(pending)) {
+                    configWithoutProvider(recovered, instanceId)
+                } else {
+                    recovered
+                }
+            }
+        }
+        return recovered
+    }
+
+    private suspend fun recoverOneOpenAIDeviceCommit(
+        source: ProviderConfig,
+        instanceId: String,
+        rawMarker: String?,
+    ): ProviderConfig {
+        if (instanceId.isBlank()) {
+            runCatching { openAIDeviceCommitPrefs.edit().remove(instanceId).commit() }
+            return source
+        }
+
+        val markerStage = rawMarker?.let { value ->
+            runCatching { OpenAIDevicePendingCommitStage.valueOf(value) }.getOrNull()
+        }
+        val instance = source.instances.firstOrNull { it.id == instanceId }
+        val providerKind = when {
+            instance == null -> OpenAIDeviceRecoveryProviderKind.ABSENT
+            isOfficialOpenAIDeviceProvider(instance) ->
+                OpenAIDeviceRecoveryProviderKind.TARGET_OPENAI_OAUTH
+            else -> OpenAIDeviceRecoveryProviderKind.UNRELATED
+        }
+        val oauthManager = OpenAIOAuthManager(context, instanceId)
+        val apiMirror = encryptedPrefs.getString("apikey_$instanceId", null)
+        val credentialsMatch =
+            providerKind == OpenAIDeviceRecoveryProviderKind.TARGET_OPENAI_OAUTH &&
+                !apiMirror.isNullOrBlank() &&
+                oauthManager.hasCompleteDeviceTokens() &&
+                oauthManager.storedAccessTokenMatches(apiMirror)
+
+        return when (
+            decideOpenAIDeviceRecoveryAction(
+                stage = markerStage,
+                providerKind = providerKind,
+                credentialsCompleteAndMatching = credentialsMatch,
+            )
+        ) {
+            OpenAIDeviceRecoveryAction.FINALIZE,
+            OpenAIDeviceRecoveryAction.CLEAR_MARKER_ONLY,
+            -> {
+                runCatching {
+                    openAIDeviceCommitPrefs.edit().remove(instanceId).commit()
+                }
+                source
+            }
+
+            OpenAIDeviceRecoveryAction.ROLLBACK -> {
+                val oauthCleared = runCatching {
+                    check(oauthManager.clearDeviceCredentialsStrict())
+                }.isSuccess
+                val apiCleared = runCatching {
+                    check(encryptedPrefs.edit().remove("apikey_$instanceId").commit())
+                }.isSuccess
+                var providerCleared = true
+                var result = source
+
+                if (providerKind == OpenAIDeviceRecoveryProviderKind.TARGET_OPENAI_OAUTH) {
+                    val withoutProvider = configWithoutProvider(source, instanceId)
+                    result = withoutProvider
+                    providerCleared = try {
+                        result = persistToDbAndMirror(
+                            config = withoutProvider,
+                            requireMirror = true,
+                        )
+                        true
+                    } catch (mirrorFailure: MirrorCommitException) {
+                        // DB 已清理、mirror 未清理；隐藏半提交 Provider 并保留 marker。
+                        result = mirrorFailure.canonicalConfig
+                        false
+                    } catch (_: Exception) {
+                        // 内存中仍隐藏半提交 Provider；marker 使下一次启动继续尝试。
+                        false
+                    }
+                }
+
+                if (oauthCleared && apiCleared && providerCleared) {
+                    runCatching {
+                        openAIDeviceCommitPrefs.edit().remove(instanceId).commit()
+                    }
+                }
+                result
+            }
+        }
+    }
+
     val instances: List<ProviderInstance> get() = _config.value.instances
 
     fun addInstance(instance: ProviderInstance) {
         ensureConfigLoaded()
-        val config = _config.value
+        withProviderMutationLock {
+            val config = _config.value
         config.instances.add(instance)
         // Seed built-in model entries ONLY when the seed is appropriate for this
         // instance. Mirrors iOS ProviderConfigStore.addInstance:
@@ -550,7 +1017,8 @@ class ProviderRepository(private val context: Context) {
         saveConfig(config)
         // Stale from the start so the next background sweep (or an explicit
         // triggerBackgroundRefreshIfStale call) will fetch it.
-        invalidateModelCache(instance.id)
+            invalidateModelCache(instance.id)
+        }
     }
 
     /**
@@ -569,11 +1037,13 @@ class ProviderRepository(private val context: Context) {
      *    modality from /v1/models; restore the template's authoritative
      *    modality when it diverged.
      */
-    fun ensureVoiceTemplateModels() = synchronized(configLock) {
+    fun ensureVoiceTemplateModels() {
         ensureConfigLoaded()
-        val config = _config.value
-        var changed = false
-        for (instance in config.instances) {
+        withProviderMutationLock {
+            synchronized(configLock) {
+                val config = _config.value
+                var changed = false
+                for (instance in config.instances) {
             val tpl = VoiceProviderTemplate.template(instance.customBaseURL) ?: continue
             val templateById = tpl.mockModels.associateBy { it.id }
             val instanceEntries = config.modelEntries.filter { it.providerInstanceId == instance.id }
@@ -616,8 +1086,10 @@ class ProviderRepository(private val context: Context) {
                 config.modelEntries[i] = e.copy(baseModel = tplModel)
                 changed = true
             }
+            }
+                if (changed) saveConfig(config)
+            }
         }
-        if (changed) saveConfig(config)
     }
 
     /**
@@ -636,10 +1108,11 @@ class ProviderRepository(private val context: Context) {
 
     fun updateInstance(instance: ProviderInstance) {
         ensureConfigLoaded()
-        val config = _config.value
-        val idx = config.instances.indexOfFirst { it.id == instance.id }
-        if (idx >= 0) {
-            val prior = config.instances[idx]
+        withProviderMutationLock {
+            val config = _config.value
+            val idx = config.instances.indexOfFirst { it.id == instance.id }
+            if (idx >= 0) {
+                val prior = config.instances[idx]
             // [T-android-image-endpoint-mode] If the base URL or v1-suffix
             // changed, the previously probed image endpoint may not exist on the
             // new upstream — drop the cached resolution so auto mode re-probes.
@@ -652,25 +1125,33 @@ class ProviderRepository(private val context: Context) {
             ) {
                 instance.imageEndpointResolved = null
             }
-            config.instances[idx] = instance
-            saveConfig(config)
+                config.instances[idx] = instance
+                saveConfig(config)
             // Any change that could move the model list (base URL, credential
             // swap, enabled flag, API format) invalidates the cache. Cheap to
             // over-invalidate.
-            if (prior.effectiveBaseURL != instance.effectiveBaseURL ||
-                prior.credentialType != instance.credentialType ||
-                prior.isEnabled != instance.isEnabled ||
-                prior.useResponsesAPI != instance.useResponsesAPI
-            ) {
-                invalidateModelCache(instance.id)
+                if (prior.effectiveBaseURL != instance.effectiveBaseURL ||
+                    prior.credentialType != instance.credentialType ||
+                    prior.isEnabled != instance.isEnabled ||
+                    prior.useResponsesAPI != instance.useResponsesAPI
+                ) {
+                    invalidateModelCache(instance.id)
+                }
             }
         }
     }
 
     fun removeInstance(instanceId: String) {
         ensureConfigLoaded()
-        invalidateModelCache(instanceId)
-        val config = _config.value
+        withProviderMutationLock {
+            invalidateModelCache(instanceId)
+            val config = _config.value
+        // Capture the instance before removing it from the configuration. Its
+        // provider and credential types decide whether an encrypted OAuth
+        // namespace exists and therefore must be cleared along with the API-key
+        // mirror. Looking it up after removeAll() previously made complete
+        // credential cleanup impossible.
+        val removedInstance = config.instances.firstOrNull { it.id == instanceId }
         val removedEntryIds = config.modelEntries
             .filter { it.providerInstanceId == instanceId }
             .map { it.id }
@@ -692,7 +1173,15 @@ class ProviderRepository(private val context: Context) {
         }
 
         saveConfig(config)
-        deleteApiKey(instanceId)
+            clearRemovedProviderCredentials(
+                instanceId = instanceId,
+                removedInstance = removedInstance,
+                clearOAuthCredentials = { instance ->
+                    OAuthManager.forInstance(context, instance)?.logout()
+                },
+                clearApiKey = ::deleteApiKey,
+            )
+        }
     }
 
     /**
@@ -706,12 +1195,16 @@ class ProviderRepository(private val context: Context) {
      */
     fun setImageEndpointResolved(instanceId: String, endpoint: ImageEndpointMode) {
         ensureConfigLoaded()
-        val config = _config.value
-        val idx = config.instances.indexOfFirst { it.id == instanceId }
-        if (idx < 0) return
-        if (config.instances[idx].imageEndpointResolved == endpoint) return
-        config.instances[idx].imageEndpointResolved = endpoint
-        saveConfig(config)
+        withProviderMutationLock {
+            val config = _config.value
+            val idx = config.instances.indexOfFirst { it.id == instanceId }
+            if (idx < 0) return@withProviderMutationLock
+            if (config.instances[idx].imageEndpointResolved == endpoint) {
+                return@withProviderMutationLock
+            }
+            config.instances[idx].imageEndpointResolved = endpoint
+            saveConfig(config)
+        }
     }
 
     fun instance(id: String): ProviderInstance? =
@@ -840,12 +1333,19 @@ class ProviderRepository(private val context: Context) {
         return instance.isEnabled
     }
 
-    fun replaceEntries(instanceId: String, models: List<LLMModel>) = synchronized(configLock) {
+    fun replaceEntries(instanceId: String, models: List<LLMModel>) {
         ensureConfigLoaded()
-        // Hot path for concurrent autoRefreshModels coroutines (one per
-        // enabled instance) — without this lock, two replaceEntries() calls
-        // race on the shared config.modelEntries ArrayList.
-        val config = _config.value
+        withProviderMutationLock {
+            synchronized(configLock) {
+            // Hot path for concurrent autoRefreshModels coroutines (one per
+            // enabled instance) — without this lock, two replaceEntries() calls
+            // race on the shared config.modelEntries ArrayList.
+                val config = _config.value
+                // 模型请求完成前 Provider 可能已被删除；此时必须丢弃结果，不能为
+                // 不存在的 instance 重新创建孤立 ModelEntry。
+                if (config.instances.none { it.id == instanceId }) {
+                    return@withProviderMutationLock
+                }
         val existing = config.modelEntries.filter { it.providerInstanceId == instanceId }
         val existingEntryIds = existing.map { it.id }.toSet()
 
@@ -946,115 +1446,135 @@ class ProviderRepository(private val context: Context) {
             }
         }
 
-        saveConfig(config)
-        // Stamp so staleness checks know this instance just refreshed.
-        markInstanceFetched(instanceId)
+                saveConfig(config)
+                // Stamp so staleness checks know this instance just refreshed.
+                markInstanceFetched(instanceId)
+            }
+        }
     }
 
     // --- Model Entry management ---
 
     fun addEntry(entry: ModelEntry) {
         ensureConfigLoaded()
-        val config = _config.value
-        if (!entry.isCustom) {
-            val exists = config.modelEntries.any {
-                it.providerInstanceId == entry.providerInstanceId && it.baseModel.id == entry.baseModel.id
+        withProviderMutationLock {
+            val config = _config.value
+            if (!entry.isCustom) {
+                val exists = config.modelEntries.any {
+                    it.providerInstanceId == entry.providerInstanceId &&
+                        it.baseModel.id == entry.baseModel.id
+                }
+                if (exists) return@withProviderMutationLock
             }
-            if (exists) return
+            config.modelEntries.add(entry)
+            saveConfig(config)
         }
-        config.modelEntries.add(entry)
-        saveConfig(config)
     }
 
     fun updateEntry(entry: ModelEntry) {
         ensureConfigLoaded()
-        val config = _config.value
-        val idx = config.modelEntries.indexOfFirst { it.id == entry.id }
-        if (idx >= 0) {
-            config.modelEntries[idx] = entry.copy(userModifiedAt = System.currentTimeMillis())
-            saveConfig(config)
+        withProviderMutationLock {
+            val config = _config.value
+            val idx = config.modelEntries.indexOfFirst { it.id == entry.id }
+            if (idx >= 0) {
+                config.modelEntries[idx] =
+                    entry.copy(userModifiedAt = System.currentTimeMillis())
+                saveConfig(config)
+            }
         }
     }
 
     fun removeEntry(entryId: String) {
         ensureConfigLoaded()
-        val config = _config.value
-        config.modelEntries.removeAll { it.id == entryId }
-        config.modelGroups.forEach { group ->
-            group.memberEntryIds.removeAll { it == entryId }
+        withProviderMutationLock {
+            val config = _config.value
+            config.modelEntries.removeAll { it.id == entryId }
+            config.modelGroups.forEach { group ->
+                group.memberEntryIds.removeAll { it == entryId }
+            }
+            // T171: cascade-clean the agent-loop direct-entry pin so the
+            // AgentLoopModelsScreen never surfaces a checkmark on a model that
+            // no longer exists. Mirrors iOS ProviderConfigStore.removeEntry
+            // (Providers/ProviderConfigStore.swift L268).
+            config.agentLoopModelEntryIds.removeAll { it == entryId }
+            saveConfig(config)
         }
-        // T171: cascade-clean the agent-loop direct-entry pin so the
-        // AgentLoopModelsScreen never surfaces a checkmark on a model that
-        // no longer exists. Mirrors iOS ProviderConfigStore.removeEntry
-        // (Providers/ProviderConfigStore.swift L268).
-        config.agentLoopModelEntryIds.removeAll { it == entryId }
-        saveConfig(config)
     }
 
     // --- Model Group management ---
 
     fun addGroup(group: ModelGroup) {
         ensureConfigLoaded()
-        val config = _config.value
-        config.modelGroups.add(group)
-        saveConfig(config)
+        withProviderMutationLock {
+            val config = _config.value
+            config.modelGroups.add(group)
+            saveConfig(config)
+        }
     }
 
     fun updateGroup(group: ModelGroup) {
         ensureConfigLoaded()
-        val config = _config.value
-        val idx = config.modelGroups.indexOfFirst { it.id == group.id }
-        if (idx >= 0) {
-            config.modelGroups[idx] = group
-            saveConfig(config)
+        withProviderMutationLock {
+            val config = _config.value
+            val idx = config.modelGroups.indexOfFirst { it.id == group.id }
+            if (idx >= 0) {
+                config.modelGroups[idx] = group
+                saveConfig(config)
+            }
         }
     }
 
     fun removeGroup(groupId: String) {
         ensureConfigLoaded()
-        val config = _config.value
-        config.modelGroups.removeAll { it.id == groupId }
-        if (config.defaultPrimaryGroupId == groupId) {
-            config.defaultPrimaryGroupId = null
+        withProviderMutationLock {
+            val config = _config.value
+            config.modelGroups.removeAll { it.id == groupId }
+            if (config.defaultPrimaryGroupId == groupId) {
+                config.defaultPrimaryGroupId = null
+            }
+            if (config.defaultSubGroupId == groupId) {
+                config.defaultSubGroupId = null
+            }
+            if (config.voiceInputGroupId == groupId) {
+                config.voiceInputGroupId = null
+            }
+            if (config.voiceOutputGroupId == groupId) {
+                config.voiceOutputGroupId = null
+            }
+            config.agentLoopGroupIds.removeAll { it == groupId }
+            saveConfig(config)
         }
-        if (config.defaultSubGroupId == groupId) {
-            config.defaultSubGroupId = null
-        }
-        if (config.voiceInputGroupId == groupId) {
-            config.voiceInputGroupId = null
-        }
-        if (config.voiceOutputGroupId == groupId) {
-            config.voiceOutputGroupId = null
-        }
-        config.agentLoopGroupIds.removeAll { it == groupId }
-        saveConfig(config)
     }
 
     /** Set the agent-loop-visible entry ID list (individual model entries). */
     fun setAgentLoopEntryIds(ids: List<String>) {
         ensureConfigLoaded()
-        val config = _config.value
-        config.agentLoopModelEntryIds.clear()
+        withProviderMutationLock {
+            val config = _config.value
+            config.agentLoopModelEntryIds.clear()
         // [T-android-agentloop-dup-key-crash] Dedup at the sink (preserving
         // first-seen order). addAgentLoopEntry guards against dups, but any
         // path writing straight through this sink (cross-device sync merge,
         // reorder write-back, data migration) could otherwise persist a
         // duplicate id — which surfaces downstream as two pinnedEntries with
         // the same id, a duplicate LazyColumn key, and a crash on scroll.
-        config.agentLoopModelEntryIds.addAll(ids.distinct())
-        saveConfig(config)
+            config.agentLoopModelEntryIds.addAll(ids.distinct())
+            saveConfig(config)
+        }
     }
 
     /** Set the agent-loop-visible group ID list. */
     fun setAgentLoopGroupIds(ids: List<String>) {
         ensureConfigLoaded()
-        val config = _config.value
-        config.agentLoopGroupIds.clear()
+        withProviderMutationLock {
+            val config = _config.value
+            config.agentLoopGroupIds.clear()
         // [T-android-agentloop-dup-key-crash] Dedup at the sink (see above) so
         // no write path can persist duplicate group ids → duplicate LazyColumn
         // key on the agent-loop groups list.
-        config.agentLoopGroupIds.addAll(ids.distinct())
-        saveConfig(config)
+            config.agentLoopGroupIds.addAll(ids.distinct())
+            saveConfig(config)
+        }
     }
 
     // T182: thin add/remove helpers used by AgentLoopModelsSection +
@@ -1066,30 +1586,52 @@ class ProviderRepository(private val context: Context) {
 
     /** Append [entryId] to the agent-loop direct-pin list if not already there. */
     fun addAgentLoopEntry(entryId: String) {
-        val cur = _config.value.agentLoopModelEntryIds.toList()
-        if (entryId in cur) return
-        setAgentLoopEntryIds(cur + entryId)
+        ensureConfigLoaded()
+        withProviderMutationLock {
+            val config = _config.value
+            if (entryId in config.agentLoopModelEntryIds) {
+                return@withProviderMutationLock
+            }
+            config.agentLoopModelEntryIds.add(entryId)
+            saveConfig(config)
+        }
     }
 
     /** Remove [entryId] from the agent-loop direct-pin list. No-op if absent. */
     fun removeAgentLoopEntry(entryId: String) {
-        val cur = _config.value.agentLoopModelEntryIds.toList()
-        if (entryId !in cur) return
-        setAgentLoopEntryIds(cur.filterNot { it == entryId })
+        ensureConfigLoaded()
+        withProviderMutationLock {
+            val config = _config.value
+            if (!config.agentLoopModelEntryIds.remove(entryId)) {
+                return@withProviderMutationLock
+            }
+            saveConfig(config)
+        }
     }
 
     /** Append [groupId] to the agent-loop group-pin list if not already there. */
     fun addAgentLoopGroup(groupId: String) {
-        val cur = _config.value.agentLoopGroupIds.toList()
-        if (groupId in cur) return
-        setAgentLoopGroupIds(cur + groupId)
+        ensureConfigLoaded()
+        withProviderMutationLock {
+            val config = _config.value
+            if (groupId in config.agentLoopGroupIds) {
+                return@withProviderMutationLock
+            }
+            config.agentLoopGroupIds.add(groupId)
+            saveConfig(config)
+        }
     }
 
     /** Remove [groupId] from the agent-loop group-pin list. No-op if absent. */
     fun removeAgentLoopGroup(groupId: String) {
-        val cur = _config.value.agentLoopGroupIds.toList()
-        if (groupId !in cur) return
-        setAgentLoopGroupIds(cur.filterNot { it == groupId })
+        ensureConfigLoaded()
+        withProviderMutationLock {
+            val config = _config.value
+            if (!config.agentLoopGroupIds.remove(groupId)) {
+                return@withProviderMutationLock
+            }
+            saveConfig(config)
+        }
     }
 
     // T186: reorder helpers — UI keeps a local mutable copy during
@@ -1098,15 +1640,29 @@ class ProviderRepository(private val context: Context) {
     // against a stale dragged-from-different-snapshot reorder slipping
     // in mid-write (e.g. a cascade-cleanup raced with the drag).
     fun reorderAgentLoopEntries(newOrder: List<String>) {
-        val cur = _config.value.agentLoopModelEntryIds.toSet()
-        if (newOrder.toSet() != cur) return
-        setAgentLoopEntryIds(newOrder)
+        ensureConfigLoaded()
+        withProviderMutationLock {
+            val config = _config.value
+            if (newOrder.toSet() != config.agentLoopModelEntryIds.toSet()) {
+                return@withProviderMutationLock
+            }
+            config.agentLoopModelEntryIds.clear()
+            config.agentLoopModelEntryIds.addAll(newOrder.distinct())
+            saveConfig(config)
+        }
     }
 
     fun reorderAgentLoopGroups(newOrder: List<String>) {
-        val cur = _config.value.agentLoopGroupIds.toSet()
-        if (newOrder.toSet() != cur) return
-        setAgentLoopGroupIds(newOrder)
+        ensureConfigLoaded()
+        withProviderMutationLock {
+            val config = _config.value
+            if (newOrder.toSet() != config.agentLoopGroupIds.toSet()) {
+                return@withProviderMutationLock
+            }
+            config.agentLoopGroupIds.clear()
+            config.agentLoopGroupIds.addAll(newOrder.distinct())
+            saveConfig(config)
+        }
     }
 
     /**
@@ -1147,17 +1703,23 @@ class ProviderRepository(private val context: Context) {
     var defaultPrimaryGroupId: String?
         get() = _config.value.defaultPrimaryGroupId
         set(value) {
-            val config = _config.value
-            config.defaultPrimaryGroupId = value
-            saveConfig(config)
+            ensureConfigLoaded()
+            withProviderMutationLock {
+                val config = _config.value
+                config.defaultPrimaryGroupId = value
+                saveConfig(config)
+            }
         }
 
     var defaultSubGroupId: String?
         get() = _config.value.defaultSubGroupId
         set(value) {
-            val config = _config.value
-            config.defaultSubGroupId = value
-            saveConfig(config)
+            ensureConfigLoaded()
+            withProviderMutationLock {
+                val config = _config.value
+                config.defaultSubGroupId = value
+                saveConfig(config)
+            }
         }
 
     // --- Voice groups [T-android-provider-voice] ---
@@ -1166,18 +1728,22 @@ class ProviderRepository(private val context: Context) {
         get() = _config.value.voiceInputGroupId
         set(value) {
             ensureConfigLoaded()
-            val config = _config.value
-            config.voiceInputGroupId = value
-            saveConfig(config)
+            withProviderMutationLock {
+                val config = _config.value
+                config.voiceInputGroupId = value
+                saveConfig(config)
+            }
         }
 
     var voiceOutputGroupId: String?
         get() = _config.value.voiceOutputGroupId
         set(value) {
             ensureConfigLoaded()
-            val config = _config.value
-            config.voiceOutputGroupId = value
-            saveConfig(config)
+            withProviderMutationLock {
+                val config = _config.value
+                config.voiceOutputGroupId = value
+                saveConfig(config)
+            }
         }
 
     /**
@@ -1190,23 +1756,31 @@ class ProviderRepository(private val context: Context) {
      */
     fun ensureDefaultVoiceInputGroup(): String? {
         ensureConfigLoaded()
-        val config = _config.value
-        config.voiceInputGroupId?.let { gid ->
-            if (config.modelGroups.any { it.id == gid }) return gid
+        return withProviderMutationLock {
+            val config = _config.value
+            config.voiceInputGroupId?.let { gid ->
+                if (config.modelGroups.any { it.id == gid }) {
+                    return@withProviderMutationLock gid
+                }
+            }
+            val sentinel = SystemVoiceIds.BUILTIN_PROVIDER_ID
+            val group = ModelGroup(
+                name = "Voice Input",
+                memberEntryIds = mutableListOf(
+                    "$sentinel/${SystemVoiceIds.SYSTEM_ASR_ONLINE}",
+                    "$sentinel/${SystemVoiceIds.SYSTEM_ASR_OFFLINE}",
+                ),
+            )
+            config.modelGroups.add(group)
+            config.voiceInputGroupId = group.id
+            saveConfig(config)
+            android.util.Log.i(
+                "ProviderRepo",
+                "[Voice] auto-created default Voice Input group " +
+                    "${group.id.take(8)} [System ASR online+offline]",
+            )
+            group.id
         }
-        val sentinel = SystemVoiceIds.BUILTIN_PROVIDER_ID
-        val group = ModelGroup(
-            name = "Voice Input",
-            memberEntryIds = mutableListOf(
-                "$sentinel/${SystemVoiceIds.SYSTEM_ASR_ONLINE}",
-                "$sentinel/${SystemVoiceIds.SYSTEM_ASR_OFFLINE}",
-            ),
-        )
-        config.modelGroups.add(group)
-        config.voiceInputGroupId = group.id
-        saveConfig(config)
-        android.util.Log.i("ProviderRepo", "[Voice] auto-created default Voice Input group ${group.id.take(8)} [System ASR online+offline]")
-        return group.id
     }
 
     /**
@@ -1216,20 +1790,28 @@ class ProviderRepository(private val context: Context) {
      */
     fun ensureDefaultVoiceOutputGroup(): String? {
         ensureConfigLoaded()
-        val config = _config.value
-        config.voiceOutputGroupId?.let { gid ->
-            if (config.modelGroups.any { it.id == gid }) return gid
+        return withProviderMutationLock {
+            val config = _config.value
+            config.voiceOutputGroupId?.let { gid ->
+                if (config.modelGroups.any { it.id == gid }) {
+                    return@withProviderMutationLock gid
+                }
+            }
+            val sentinel = SystemVoiceIds.BUILTIN_PROVIDER_ID
+            val group = ModelGroup(
+                name = "Voice Output",
+                memberEntryIds = mutableListOf("$sentinel/${SystemVoiceIds.SYSTEM_TTS}"),
+            )
+            config.modelGroups.add(group)
+            config.voiceOutputGroupId = group.id
+            saveConfig(config)
+            android.util.Log.i(
+                "ProviderRepo",
+                "[Voice] auto-created default Voice Output group " +
+                    "${group.id.take(8)} [System Voice (Auto)]",
+            )
+            group.id
         }
-        val sentinel = SystemVoiceIds.BUILTIN_PROVIDER_ID
-        val group = ModelGroup(
-            name = "Voice Output",
-            memberEntryIds = mutableListOf("$sentinel/${SystemVoiceIds.SYSTEM_TTS}"),
-        )
-        config.modelGroups.add(group)
-        config.voiceOutputGroupId = group.id
-        saveConfig(config)
-        android.util.Log.i("ProviderRepo", "[Voice] auto-created default Voice Output group ${group.id.take(8)} [System Voice (Auto)]")
-        return group.id
     }
 
     /**
@@ -1476,8 +2058,8 @@ class ProviderRepository(private val context: Context) {
     fun setVoiceShadowDisabled(instanceId: String, disabled: Boolean) {
         prefs.edit().putBoolean("voiceShadowDisabled.$instanceId", disabled).apply()
         // Bump revision so Compose collectors re-read the shadow list.
-        val config = _config.value
         synchronized(configLock) {
+            val config = _config.value
             _config.value = config.copy(revision = config.revision + 1)
         }
     }
@@ -1571,15 +2153,15 @@ class ProviderRepository(private val context: Context) {
 
         android.util.Log.i("ProviderRepo", "refreshModels: id=${instance.id} type=${instance.providerType} credential=${instance.credentialType} hasKey=${apiKey != null} keyLen=${apiKey?.length ?: 0} baseURL=${instance.effectiveBaseURL}")
 
-        // OpenAI Codex OAuth: use static model list (OAuth tokens can't call /v1/models)
-        if (instance.providerType == ProviderType.openAI
-            && instance.credentialType == ProviderCredential.oauth
+        // 保留既有 OpenAI OAuth 刷新语义：先让 validAccessToken() 更新临近过期
+        // Token 及 API-key 镜像，再应用无需 /v1/models 请求的静态 Codex 模型。
+        // 新建设备登录的首次模型准备直接调用 applyOpenAIOAuthModels()，不会在刚
+        // 保存后无端刷新；用户后续主动/每日刷新仍继续进入原自动刷新路径。
+        if (instance.providerType == ProviderType.openAI &&
+            instance.credentialType == ProviderCredential.oauth
         ) {
-            val models = OpenAIModelsApi.fetchModelsOAuth()
-            if (models.isNotEmpty()) {
-                replaceEntries(instance.id, models)
-                return
-            }
+            applyOpenAIOAuthModels(instance)
+            return
         }
 
         // Step 1: Try provider API (requires API key)
@@ -2065,10 +2647,12 @@ class ProviderRepository(private val context: Context) {
                 ))
             }
             // Import replaces built-in entries directly (not via replaceEntries which takes LLMModel list)
-            val cfg = _config.value
-            cfg.modelEntries.removeAll { it.providerInstanceId == instance.id }
-            cfg.modelEntries.addAll(entries)
-            saveConfig(cfg)
+            withProviderMutationLock {
+                val cfg = _config.value
+                cfg.modelEntries.removeAll { it.providerInstanceId == instance.id }
+                cfg.modelEntries.addAll(entries)
+                saveConfig(cfg)
+            }
         }
 
         return resolvedLabel

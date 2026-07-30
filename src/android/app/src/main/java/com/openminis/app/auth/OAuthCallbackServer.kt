@@ -13,6 +13,36 @@ class OAuthCallbackServer(
 ) {
     companion object {
         private const val TAG = "OAuthCallbackServer"
+
+        /**
+         * Reduce an HTTP request line to method, path and protocol before it
+         * enters logcat. OAuth callback query parameters contain the one-time
+         * authorization code and state, so logging the raw target would persist
+         * credentials even though the server only needs them in memory.
+         */
+        internal fun sanitizeRequestLine(requestLine: String): String {
+            val parts = requestLine.split(" ", limit = 3)
+            if (parts.size < 2) return "<malformed request line>"
+
+            val method = parts[0]
+                .filter { it.isLetter() }
+                .take(16)
+                .ifEmpty { "UNKNOWN" }
+            val path = parts[1]
+                .substringBefore("?")
+                .substringBefore("#")
+                .replace(Regex("[\\r\\n\\t]"), "")
+                .take(200)
+                .ifEmpty { "/" }
+            val protocol = parts.getOrNull(2)
+                ?.replace(Regex("[\\r\\n\\t]"), "")
+                ?.take(16)
+                .orEmpty()
+
+            return listOf(method, path, protocol)
+                .filter { it.isNotEmpty() }
+                .joinToString(" ")
+        }
     }
 
     private var serverSocket: ServerSocket? = null
@@ -61,7 +91,7 @@ class OAuthCallbackServer(
                     try {
                         val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                         val requestLine = reader.readLine() ?: continue
-                        Log.d(TAG, "Request: $requestLine")
+                        Log.d(TAG, "Request: ${sanitizeRequestLine(requestLine)}")
 
                         // CORS preflight for providers (e.g. xAI) that
                         // OPTIONS /callback from their authorization page
@@ -123,12 +153,16 @@ class OAuthCallbackServer(
                         }
                         socket.close()
                     } catch (e: Exception) {
-                        Log.w(TAG, "Error handling connection", e)
+                        // URI parser exceptions may embed the complete request
+                        // target, including code/state, in their message.
+                        Log.w(TAG, "Error handling OAuth callback connection: ${e.javaClass.simpleName}")
                         try { socket.close() } catch (_: Exception) {}
                     }
                 }
             } catch (e: Exception) {
-                if (running) Log.e(TAG, "Server error", e)
+                if (running) {
+                    Log.e(TAG, "OAuth callback server error: ${e.javaClass.simpleName}")
+                }
             }
         }.start()
     }
@@ -148,7 +182,7 @@ class OAuthCallbackServer(
             val cancel = onExternalCancel
             onExternalCancel = null
             try { cancel?.invoke() } catch (e: Exception) {
-                Log.w(TAG, "onExternalCancel threw: ${e.message}")
+                Log.w(TAG, "onExternalCancel threw: ${e.javaClass.simpleName}")
             }
         }
     }

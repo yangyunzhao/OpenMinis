@@ -56,6 +56,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -90,22 +91,32 @@ private enum class AddProviderStep {
 @Composable
 fun AddProviderScreen(
     providerRepository: ProviderRepository,
+    openAIDeviceLoginViewModel: OpenAIDeviceLoginViewModel,
     onBack: () -> Unit,
     onSaved: () -> Unit,
 ) {
-    var step by remember { mutableStateOf(AddProviderStep.CHOOSE_TYPE) }
-    var selectedType by remember { mutableStateOf<ProviderType?>(null) }
-    var selectedCredential by remember { mutableStateOf<ProviderCredential?>(null) }
+    var step by rememberSaveable { mutableStateOf(AddProviderStep.CHOOSE_TYPE) }
+    var selectedType by rememberSaveable { mutableStateOf<ProviderType?>(null) }
+    var selectedCredential by rememberSaveable { mutableStateOf<ProviderCredential?>(null) }
     // [T-android-provider-voice] Non-null when the flow was entered from a
     // Voice Chat Provider template row — preseeds type/base URL/label/appendV1
     // on the configure step (mirrors iOS applyVoiceTemplate).
-    var selectedVoiceTemplate by remember {
-        mutableStateOf<com.openminis.app.data.model.VoiceProviderTemplate?>(null)
+    var selectedVoiceTemplateId by rememberSaveable { mutableStateOf<String?>(null) }
+    val selectedVoiceTemplate = remember(selectedVoiceTemplateId) {
+        com.openminis.app.data.model.VoiceProviderTemplate.all
+            .firstOrNull { it.id == selectedVoiceTemplateId }
     }
 
     // Unified back handler: reuse each step's onBack so predictive-back gesture
     // and the top-bar arrow behave identically (go back to prior step, not exit).
     val handleBack: () -> Unit = {
+        if (
+            step == AddProviderStep.CONFIGURE &&
+            selectedType == ProviderType.openAI &&
+            selectedCredential == ProviderCredential.oauth
+        ) {
+            openAIDeviceLoginViewModel.cancel()
+        }
         when (step) {
             AddProviderStep.CHOOSE_TYPE -> onBack()
             AddProviderStep.CHOOSE_CREDENTIAL -> {
@@ -118,7 +129,7 @@ fun AddProviderScreen(
                 if (selectedVoiceTemplate != null) {
                     step = AddProviderStep.CHOOSE_TYPE
                     selectedType = null
-                    selectedVoiceTemplate = null
+                    selectedVoiceTemplateId = null
                 } else {
                     val creds = availableCredentials(selectedType!!)
                     if (creds.size == 1) {
@@ -153,7 +164,7 @@ fun AddProviderScreen(
             onSelectVoiceTemplate = { template ->
                 // Mirror iOS applyVoiceTemplate: pick the underlying protocol,
                 // force API-key credential, jump straight to configure.
-                selectedVoiceTemplate = template
+                selectedVoiceTemplateId = template.id
                 selectedType = template.providerType
                 selectedCredential = ProviderCredential.apiKey
                 step = AddProviderStep.CONFIGURE
@@ -171,6 +182,7 @@ fun AddProviderScreen(
             providerType = selectedType!!,
             credentialType = selectedCredential!!,
             providerRepository = providerRepository,
+            openAIDeviceLoginViewModel = openAIDeviceLoginViewModel,
             voiceTemplate = selectedVoiceTemplate,
             onBack = handleBack,
             onSaved = onSaved,
@@ -369,6 +381,7 @@ private fun ConfigureProviderScreen(
     providerType: ProviderType,
     credentialType: ProviderCredential,
     providerRepository: ProviderRepository,
+    openAIDeviceLoginViewModel: OpenAIDeviceLoginViewModel,
     voiceTemplate: com.openminis.app.data.model.VoiceProviderTemplate? = null,
     onBack: () -> Unit,
     onSaved: () -> Unit,
@@ -387,7 +400,7 @@ private fun ConfigureProviderScreen(
         }
     }
 
-    var label by remember { mutableStateOf(defaultLabel) }
+    var label by rememberSaveable { mutableStateOf(defaultLabel) }
     // [T-provider-name-chinese-34602, port iOS 7b283951] Flips true the
     // first time the user types into the label field. While `false`, the
     // LaunchedEffect below keeps `label` glued to the auto-incremented
@@ -400,12 +413,12 @@ private fun ConfigureProviderScreen(
     // ConfigureProviderScreen on step navigation, makes the field
     // appear to reject Chinese — the iOS root cause Telegram 34602
     // reported, with the same Android equivalent here.
-    var labelEdited by remember { mutableStateOf(false) }
+    var labelEdited by rememberSaveable { mutableStateOf(false) }
     androidx.compose.runtime.LaunchedEffect(defaultLabel, labelEdited) {
         if (!labelEdited) label = defaultLabel
     }
     var apiKey by remember { mutableStateOf("") }
-    var customBaseURL by remember { mutableStateOf(voiceTemplate?.baseURL ?: "") }
+    var customBaseURL by rememberSaveable { mutableStateOf(voiceTemplate?.baseURL ?: "") }
 
     SettingsScaffold(
         title = stringResource(R.string.add_provider_configure_provider, providerType.displayName),
@@ -447,6 +460,7 @@ private fun ConfigureProviderScreen(
                 providerType = providerType,
                 label = label,
                 providerRepository = providerRepository,
+                openAIDeviceLoginViewModel = openAIDeviceLoginViewModel,
                 onSaved = onSaved,
             )
         }
@@ -623,8 +637,18 @@ private fun ColumnScope.OAuthConfigSection(
     providerType: ProviderType,
     label: String,
     providerRepository: ProviderRepository,
+    openAIDeviceLoginViewModel: OpenAIDeviceLoginViewModel,
     onSaved: () -> Unit,
 ) {
+    if (providerType == ProviderType.openAI) {
+        OpenAIOAuthConfigSection(
+            label = label,
+            providerRepository = providerRepository,
+            viewModel = openAIDeviceLoginViewModel,
+            onSaved = onSaved,
+        )
+        return
+    }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val pendingInstanceId = remember { UUID.randomUUID().toString() }
@@ -877,6 +901,418 @@ private fun ColumnScope.OAuthConfigSection(
             enabled = manualToken.isNotBlank(),
         ) {
             Text(stringResource(R.string.provider_list_add_provider))
+        }
+    }
+}
+
+/**
+ * OpenAI 新建 Provider 的三条明确路径：设备码（推荐）、原浏览器回调、手动 Bearer。
+ * 设备码状态与提交完全由路由级 ViewModel 持有；此 UI 不接触 Token 租约。
+ */
+@Composable
+private fun ColumnScope.OpenAIOAuthConfigSection(
+    label: String,
+    providerRepository: ProviderRepository,
+    viewModel: OpenAIDeviceLoginViewModel,
+    onSaved: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val deviceState by viewModel.state.collectAsState()
+    val saveState by viewModel.saveState.collectAsState()
+    val browserInstanceId = remember { UUID.randomUUID().toString() }
+    var browserAuthenticating by remember { mutableStateOf(false) }
+    var browserAuthenticated by remember { mutableStateOf(false) }
+    var browserError by remember { mutableStateOf<String?>(null) }
+    var manualToken by remember { mutableStateOf("") }
+    var customBaseURL by rememberSaveable { mutableStateOf("") }
+    var appendV1Suffix by rememberSaveable { mutableStateOf(true) }
+    val devicePathOwnsScreen =
+        deviceState is com.openminis.app.auth.OpenAIDeviceLoginState.RequestingCode ||
+            deviceState is com.openminis.app.auth.OpenAIDeviceLoginState.WaitingForUser ||
+            deviceState is com.openminis.app.auth.OpenAIDeviceLoginState.ExchangingToken ||
+            deviceState is com.openminis.app.auth.OpenAIDeviceLoginState.Authenticated ||
+            saveState == OpenAIDeviceProviderSaveState.Saving ||
+            saveState == OpenAIDeviceProviderSaveState.Saved ||
+            saveState == OpenAIDeviceProviderSaveState.SavedWithModelLoadFailure
+    val browserPathOwnsScreen = browserAuthenticating || browserAuthenticated
+
+    androidx.compose.runtime.LaunchedEffect(customBaseURL) {
+        if (customBaseURL.isNotBlank()) viewModel.cancel()
+    }
+    androidx.compose.runtime.LaunchedEffect(saveState) {
+        if (saveState == OpenAIDeviceProviderSaveState.Saved) onSaved()
+    }
+
+    (deviceState as? com.openminis.app.auth.OpenAIDeviceLoginState.WaitingForUser)
+        ?.let { waiting ->
+            OpenAIDeviceLoginDialog(
+                attemptId = waiting.attemptId,
+                userCode = waiting.userCode,
+                verificationUrl = waiting.verificationUrl.toString(),
+                claimAutomaticBrowserOpen = viewModel::claimAutomaticBrowserOpen,
+                onCancel = viewModel::cancel,
+            )
+        }
+
+    SettingsSection(
+        header = stringResource(R.string.openai_device_sign_in),
+        footer = if (customBaseURL.isBlank()) {
+            stringResource(R.string.openai_device_recommended)
+        } else {
+            stringResource(R.string.openai_device_official_only)
+        },
+    ) {
+        SettingsCardBlock {
+            if (customBaseURL.isBlank()) {
+                when (deviceState) {
+                    com.openminis.app.auth.OpenAIDeviceLoginState.Idle,
+                    com.openminis.app.auth.OpenAIDeviceLoginState.Cancelled,
+                    com.openminis.app.auth.OpenAIDeviceLoginState.Expired,
+                    com.openminis.app.auth.OpenAIDeviceLoginState.Unsupported,
+                    is com.openminis.app.auth.OpenAIDeviceLoginState.NetworkError,
+                    is com.openminis.app.auth.OpenAIDeviceLoginState.AuthFailed,
+                    -> {
+                        val messageRes = when (saveState) {
+                            is OpenAIDeviceProviderSaveState.Failed ->
+                                R.string.openai_device_save_failed
+                            OpenAIDeviceProviderSaveState.StaleAttempt ->
+                                R.string.openai_device_save_stale
+                            else -> when (deviceState) {
+                            com.openminis.app.auth.OpenAIDeviceLoginState.Cancelled ->
+                                R.string.openai_device_cancelled
+                            com.openminis.app.auth.OpenAIDeviceLoginState.Expired ->
+                                R.string.openai_device_expired
+                            com.openminis.app.auth.OpenAIDeviceLoginState.Unsupported ->
+                                R.string.openai_device_unsupported
+                            is com.openminis.app.auth.OpenAIDeviceLoginState.NetworkError ->
+                                R.string.openai_device_network_error
+                            is com.openminis.app.auth.OpenAIDeviceLoginState.AuthFailed ->
+                                R.string.openai_device_auth_failed
+                            else -> null
+                            }
+                        }
+                        messageRes?.let {
+                            Text(
+                                stringResource(it),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                            Spacer(Modifier.height(10.dp))
+                        }
+                        MinisButton(
+                            onClick = { viewModel.start() },
+                            enabled = !browserPathOwnsScreen,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                stringResource(
+                                    if (deviceState == com.openminis.app.auth.OpenAIDeviceLoginState.Idle) {
+                                        R.string.openai_device_sign_in
+                                    } else {
+                                        R.string.openai_device_retry
+                                    },
+                                ),
+                            )
+                        }
+                    }
+
+                    is com.openminis.app.auth.OpenAIDeviceLoginState.RequestingCode -> {
+                        InlineOpenAIDeviceProgress(
+                            stringResource(R.string.openai_device_requesting),
+                            onCancel = viewModel::cancel,
+                        )
+                    }
+
+                    is com.openminis.app.auth.OpenAIDeviceLoginState.WaitingForUser -> {
+                        InlineOpenAIDeviceProgress(
+                            stringResource(R.string.openai_device_waiting),
+                            onCancel = viewModel::cancel,
+                        )
+                    }
+
+                    is com.openminis.app.auth.OpenAIDeviceLoginState.ExchangingToken -> {
+                        InlineOpenAIDeviceProgress(
+                            stringResource(R.string.openai_device_exchanging),
+                            onCancel = viewModel::cancel,
+                        )
+                    }
+
+                    is com.openminis.app.auth.OpenAIDeviceLoginState.Authenticated -> {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = Color(0xFF34C759),
+                                modifier = Modifier.size(20.dp),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                stringResource(R.string.add_provider_authenticated),
+                                fontWeight = FontWeight.Medium,
+                            )
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        when (saveState) {
+                            OpenAIDeviceProviderSaveState.Saving ->
+                                InlineOpenAIDeviceProgress(
+                                    stringResource(R.string.add_provider_save_provider),
+                                )
+
+                            is OpenAIDeviceProviderSaveState.Failed -> {
+                                Text(
+                                    stringResource(R.string.openai_device_save_failed),
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                MinisButton(
+                                    onClick = { viewModel.start() },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text(stringResource(R.string.openai_device_retry))
+                                }
+                            }
+
+                            OpenAIDeviceProviderSaveState.StaleAttempt -> {
+                                Text(
+                                    stringResource(R.string.openai_device_save_stale),
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                MinisButton(
+                                    onClick = { viewModel.start() },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text(stringResource(R.string.openai_device_retry))
+                                }
+                            }
+
+                            OpenAIDeviceProviderSaveState.SavedWithModelLoadFailure -> {
+                                Text(
+                                    stringResource(R.string.openai_device_model_failed),
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                MinisButton(
+                                    onClick = { viewModel.retryModelLoad() },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text(stringResource(R.string.openai_device_retry_models))
+                                }
+                                Spacer(Modifier.height(8.dp))
+                                MinisButton(
+                                    onClick = onSaved,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text(stringResource(R.string.add_provider_save_provider))
+                                }
+                            }
+
+                            else -> {
+                                MinisButton(
+                                    onClick = { viewModel.saveProvider(label) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text(stringResource(R.string.add_provider_save_provider))
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                Text(
+                    stringResource(R.string.openai_device_official_only),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+
+    SettingsSection(
+        header = stringResource(R.string.openai_browser_sign_in),
+        footer = stringResource(R.string.openai_browser_sign_in_description),
+    ) {
+        SettingsCardBlock {
+            if (browserAuthenticated) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.CheckCircle,
+                        contentDescription = null,
+                        tint = Color(0xFF34C759),
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.add_provider_authenticated))
+                }
+                Spacer(Modifier.height(10.dp))
+                MinisButton(
+                    onClick = {
+                        val instance = ProviderInstance(
+                            id = browserInstanceId,
+                            label = label.ifBlank { ProviderType.openAI.displayName },
+                            providerType = ProviderType.openAI,
+                            credentialType = ProviderCredential.oauth,
+                        )
+                        providerRepository.addInstance(instance)
+                        scope.launch { providerRepository.refreshModels(instance) }
+                        onSaved()
+                    },
+                    enabled = !devicePathOwnsScreen,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(stringResource(R.string.add_provider_save_provider))
+                }
+            } else {
+                MinisButton(
+                    onClick = {
+                        viewModel.cancel()
+                        browserAuthenticating = true
+                        browserError = null
+                        scope.launch {
+                            try {
+                                OpenAIOAuthManager.login(
+                                    context,
+                                    browserInstanceId,
+                                    providerRepository,
+                                )
+                                browserAuthenticated = true
+                            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                throw cancelled
+                            } catch (error: Exception) {
+                                browserError =
+                                    if (error is com.openminis.app.auth.OAuthNetworkUnreachableException) {
+                                        context.getString(
+                                            R.string.add_provider_oauth_network_unreachable,
+                                        )
+                                    } else {
+                                        error.message
+                                            ?: context.getString(R.string.openai_device_auth_failed)
+                                    }
+                            } finally {
+                                browserAuthenticating = false
+                            }
+                        }
+                    },
+                    enabled = !browserAuthenticating && !devicePathOwnsScreen,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (browserAuthenticating) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            strokeWidth = 2.dp,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(
+                        stringResource(
+                            if (browserAuthenticating) {
+                                R.string.add_provider_signing_in
+                            } else {
+                                R.string.openai_browser_sign_in
+                            },
+                        ),
+                    )
+                }
+                browserError?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        }
+    }
+
+    SettingsSection(
+        header = stringResource(R.string.add_provider_or_configure_manually),
+        footer = stringResource(R.string.add_provider_for_third_party_coding_plans_e_g_minimax),
+    ) {
+        SettingsCardBlock {
+            RowLabel(text = stringResource(R.string.add_provider_custom_api_base_optional))
+            SectionTextField(
+                value = customBaseURL,
+                onValueChange = { customBaseURL = it },
+                placeholder = "https://api.openai.com",
+                singleLine = true,
+                enabled = !devicePathOwnsScreen && !browserPathOwnsScreen,
+            )
+            Spacer(Modifier.height(12.dp))
+            RowLabel(text = stringResource(R.string.add_provider_bearer_token))
+            SectionTextField(
+                value = manualToken,
+                onValueChange = { manualToken = it },
+                singleLine = true,
+                enabled = !devicePathOwnsScreen && !browserPathOwnsScreen,
+                visualTransformation = PasswordVisualTransformation(),
+            )
+        }
+        SettingsSwitchRow(
+            title = stringResource(R.string.add_provider_auto_append_v1_quoted),
+            checked = appendV1Suffix,
+            onCheckedChange = { appendV1Suffix = it },
+            enabled = !devicePathOwnsScreen && !browserPathOwnsScreen,
+            showDivider = false,
+        )
+    }
+    Spacer(Modifier.height(20.dp))
+    MinisButton(
+        onClick = {
+            viewModel.cancel()
+            val instance = ProviderInstance(
+                id = UUID.randomUUID().toString(),
+                label = label.ifBlank { ProviderType.openAI.displayName },
+                providerType = ProviderType.openAI,
+                credentialType = ProviderCredential.oauth,
+                customBaseURL = customBaseURL.trim().ifBlank { null },
+                appendV1Suffix = appendV1Suffix,
+            )
+            providerRepository.addInstance(instance)
+            providerRepository.saveApiKey(instance.id, manualToken.trim())
+            scope.launch { providerRepository.refreshModels(instance) }
+            onSaved()
+        },
+        enabled =
+            manualToken.isNotBlank() &&
+                !devicePathOwnsScreen &&
+                !browserPathOwnsScreen,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+    ) {
+        Text(stringResource(R.string.provider_list_add_provider))
+    }
+}
+
+@Composable
+private fun InlineOpenAIDeviceProgress(
+    message: String,
+    onCancel: (() -> Unit)? = null,
+) {
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(18.dp),
+                strokeWidth = 2.dp,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        onCancel?.let {
+            Spacer(Modifier.height(8.dp))
+            androidx.compose.material3.TextButton(onClick = it) {
+                Text(stringResource(R.string.common_cancel))
+            }
         }
     }
 }

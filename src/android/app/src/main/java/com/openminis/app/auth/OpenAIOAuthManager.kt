@@ -25,9 +25,105 @@ import kotlin.coroutines.resume
  */
 class OAuthNetworkUnreachableException(cause: Throwable) : Exception(cause.message, cause)
 
+/**
+ * Safe user-facing error for an OpenAI token endpoint rejection. The response
+ * body is intentionally not retained because providers may echo authorization
+ * codes, PKCE material, or tokens in an error payload.
+ */
+class OAuthTokenExchangeException(val statusCode: Int) :
+    Exception("Token exchange failed (HTTP $statusCode)")
+
+/**
+ * Safe error for a nominally successful token response that cannot be parsed.
+ * JSON parser messages are not propagated because some implementations embed
+ * a fragment of the malformed input in the exception text.
+ */
+class OAuthTokenResponseException :
+    Exception("Token endpoint returned an invalid response")
+
 class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(context, instanceId) {
     companion object {
         private const val TAG = "CodexOAuth"
+        private val OPENAI_CREDENTIAL_KEY_NAMES = setOf(
+            "verifier",
+            "state",
+            "account_id",
+            "plan_type",
+        )
+
+        /**
+         * Redact both values generated specifically for one browser login.
+         * The state is as sensitive as the PKCE challenge for log purposes:
+         * neither value is needed to diagnose the stable URL structure.
+         */
+        internal fun sanitizeAuthorizationUrl(url: String): String =
+            url.replace(
+                Regex("([?&])(state|code_challenge)=[^&]*", RegexOption.IGNORE_CASE),
+            ) { match ->
+                "${match.groupValues[1]}${match.groupValues[2]}=<redacted>"
+            }
+
+        /** Pure key mapping used by deletion regression tests. */
+        internal fun credentialPreferenceKeys(instanceId: String): Set<String> =
+            OAuthManager.credentialPreferenceKeys(instanceId, OPENAI_CREDENTIAL_KEY_NAMES)
+
+        /** 设备提交/补偿必须覆盖的完整逻辑 key 集；纯函数供 JVM 回归测试。 */
+        internal fun deviceSnapshotKeyNames(): Set<String> = setOf(
+            "tokens",
+            "manual_bearer_token",
+            "verifier",
+            "state",
+            "account_id",
+            "plan_type",
+        )
+
+        /**
+         * Validate the status without accepting the response body. Keeping the
+         * body out of this API makes it impossible for the thrown exception to
+         * retain or interpolate server-controlled credential material.
+         */
+        internal fun requireSuccessfulTokenResponse(statusCode: Int) {
+            if (statusCode !in 200..299) {
+                throw OAuthTokenExchangeException(statusCode)
+            }
+        }
+
+        /**
+         * Parse a successful token payload while converting parser failures to
+         * a fixed, body-free exception. The original JSONException is
+         * deliberately not attached as a cause because its message may quote
+         * the malformed input.
+         */
+        internal fun parseTokenResponse(responseBody: String): JSONObject =
+            try {
+                JSONObject(responseBody)
+            } catch (_: Exception) {
+                throw OAuthTokenResponseException()
+            }
+
+        internal data class IdTokenClaims(
+            val accountId: String?,
+            val planType: String?,
+        )
+
+        /**
+         * 只提取 Codex 请求所需的两个辅助字段。解析失败返回空 claims，不保留或记录
+         * JWT 正文；ID Token 的密码学验证仍不属于本地客户端职责。
+         */
+        internal fun parseIdTokenClaims(token: String): IdTokenClaims {
+            return try {
+                val parts = token.split(".")
+                if (parts.size < 2) return IdTokenClaims(null, null)
+                val payload = String(java.util.Base64.getUrlDecoder().decode(parts[1]))
+                val json = JSONObject(payload)
+                IdTokenClaims(
+                    accountId = json.optString("chatgpt_account_id").ifEmpty { null },
+                    planType = json.optString("chatgpt_plan_type").ifEmpty { null },
+                )
+            } catch (_: Exception) {
+                IdTokenClaims(null, null)
+            }
+        }
 
         /**
          * Static helper: perform full login flow and save the access token.
@@ -44,6 +140,9 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
     private var loginCallbackServer: OAuthCallbackServer? = null
     private var expectedState: String? = null
 
+    override val additionalCredentialKeyNames: Set<String>
+        get() = OPENAI_CREDENTIAL_KEY_NAMES
+
     /**
      * Perform the full OAuth login flow.
      * Returns the access token. Throws on failure.
@@ -55,10 +154,7 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
         loginCallbackServer = null
 
         val authUrl = buildAuthorizationUrl()
-        // Redact the code_challenge so the log doesn't expose PKCE material
-        // verbatim — leave everything else so the user/diagnostician can
-        // verify scope, redirect_uri, client_id, state.
-        val redactedAuthUrl = authUrl.replace(Regex("code_challenge=[^&]+"), "code_challenge=<redacted>")
+        val redactedAuthUrl = sanitizeAuthorizationUrl(authUrl)
         AppLogger.info(TAG, "authorize URL: $redactedAuthUrl")
         AppLogger.info(TAG, "redirect_uri=$redirectUri callbackPort=$callbackPort")
 
@@ -94,7 +190,7 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
             val stateMatches = expectedState != null && state == expectedState
             AppLogger.info(
                 TAG,
-                "callback received: codeLen=${code.length} state=$state expected=$expectedState match=$stateMatches",
+                "callback received: codeLen=${code.length} statePresent=${state != null} match=$stateMatches",
             )
             if (!stateMatches) {
                 AppLogger.warning(TAG, "state mismatch — proceeding anyway to mirror prior behaviour")
@@ -108,9 +204,9 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
         return accessToken
     }
 
-    override val authURL = "https://auth.openai.com/oauth/authorize"
-    override val tokenURL = "https://auth.openai.com/oauth/token"
-    override val clientId = "app_EMoamEEZ73f0CkXaXp7hrann"
+    override val authURL = "${OpenAIDeviceAuthDefaults.ISSUER}/oauth/authorize"
+    override val tokenURL = OpenAIDeviceAuthDefaults.endpoints.exchangeTokenUrl.toString()
+    override val clientId = OpenAIDeviceAuthDefaults.CLIENT_ID
     override val clientSecret: String? = null
     override val callbackPort = 1455
     override val redirectPath = "/auth/callback"
@@ -150,6 +246,46 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
             parseIdToken(idToken)
         }
     }
+
+    /**
+     * 同步提交设备授权 Token 与 account/plan 辅助字段。
+     *
+     * 同一个 oauth_prefs editor 会先清除可能冲突的浏览器 PKCE、manual bearer 和旧
+     * account metadata，再写白名单 Token JSON。返回 false 时调用方必须补偿清理。
+     */
+    fun commitDeviceTokens(tokens: OpenAIDeviceTokens): Boolean {
+        val claims = parseIdTokenClaims(tokens.idToken)
+        val values = mutableMapOf(
+            "tokens" to tokens.toOAuthStorageJson(),
+        )
+        claims.accountId?.let { values["account_id"] = it }
+        claims.planType?.let { values["plan_type"] = it }
+        return commitOAuthSnapshot(
+            values = values,
+            removeKeyNames = deviceSnapshotKeyNames(),
+        )
+    }
+
+    /** 同步清除完整 OpenAI 凭据；用于提交补偿与启动恢复。 */
+    fun clearDeviceCredentialsStrict(): Boolean =
+        commitOAuthSnapshot(
+            values = emptyMap(),
+            removeKeyNames = deviceSnapshotKeyNames(),
+        )
+
+    /**
+     * 启动恢复只需要完整性判断，不向 Repository 暴露 Token。API mirror 必须由
+     * Repository 单独比较 access_token。
+     */
+    fun hasCompleteDeviceTokens(): Boolean {
+        val json = loadStoredTokens() ?: return false
+        return listOf("access_token", "refresh_token", "id_token").all { key ->
+            json.optString(key, "").isNotBlank()
+        }
+    }
+
+    fun storedAccessTokenMatches(expected: String): Boolean =
+        loadStoredTokens()?.optString("access_token", "") == expected
 
     /**
      * Exchange authorization code for tokens using JSON body.
@@ -210,15 +346,25 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
         response.close()
         AppLogger.info(
             TAG,
-            "token exchange response: $responseCode bodyLen=${responseBody.length} body[0..500]=${responseBody.take(500)}",
+            "token exchange response: $responseCode bodyLen=${responseBody.length}",
         )
 
-        if (responseCode !in 200..299) {
+        try {
+            requireSuccessfulTokenResponse(responseCode)
+        } catch (error: OAuthTokenExchangeException) {
             AppLogger.error(TAG, "token exchange non-2xx: $responseCode")
-            throw Exception("Token exchange failed ($responseCode): $responseBody")
+            throw error
         }
 
-        val json = JSONObject(responseBody)
+        val json = try {
+            parseTokenResponse(responseBody)
+        } catch (error: OAuthTokenResponseException) {
+            AppLogger.error(
+                TAG,
+                "token exchange response parse failed: OAuthTokenResponseException",
+            )
+            throw error
+        }
         val accessToken = json.optString("access_token", "")
         if (accessToken.isEmpty()) {
             AppLogger.error(TAG, "no access_token field in response")
@@ -308,16 +454,8 @@ class OpenAIOAuthManager(context: Context, instanceId: String) : OAuthManager(co
     }
 
     private fun parseIdToken(token: String) {
-        try {
-            val parts = token.split(".")
-            if (parts.size >= 2) {
-                val payload = String(java.util.Base64.getUrlDecoder().decode(parts[1]))
-                val json = JSONObject(payload)
-                accountId = json.optString("chatgpt_account_id").ifEmpty { null }
-                planType = json.optString("chatgpt_plan_type").ifEmpty { null }
-            }
-        } catch (e: Exception) {
-            AppLogger.warning(TAG, "id_token parse failed: ${e.javaClass.simpleName}: ${e.message}")
-        }
+        val claims = parseIdTokenClaims(token)
+        accountId = claims.accountId
+        planType = claims.planType
     }
 }

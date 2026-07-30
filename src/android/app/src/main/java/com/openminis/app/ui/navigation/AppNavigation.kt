@@ -39,6 +39,7 @@ import com.openminis.app.ui.settings.BackgroundSettingsScreen
 import com.openminis.app.ui.settings.AddModelsToGroupScreen
 import com.openminis.app.ui.settings.ShadowVoiceDetailScreen
 import com.openminis.app.ui.settings.AddProviderScreen
+import com.openminis.app.ui.settings.OpenAIDeviceLoginViewModel
 import com.openminis.app.ui.settings.ModelEntryDetailScreen
 import com.openminis.app.ui.settings.ModelGroupDetailScreen
 import com.openminis.app.ui.settings.ModelGroupsScreen
@@ -700,9 +701,15 @@ fun AppNavigation(
             )
         }
 
-        composable(Routes.ADD_PROVIDER) {
+        composable(Routes.ADD_PROVIDER) { backStackEntry ->
+            val openAIDeviceLoginViewModel: OpenAIDeviceLoginViewModel =
+                androidx.lifecycle.viewmodel.compose.viewModel(
+                    viewModelStoreOwner = backStackEntry,
+                    factory = OpenAIDeviceLoginViewModel.factory(providerRepository),
+                )
             AddProviderScreen(
                 providerRepository = providerRepository,
+                openAIDeviceLoginViewModel = openAIDeviceLoginViewModel,
                 onBack = { navController.safePopBackStack() },
                 onSaved = { navController.safePopBackStack() },
             )
