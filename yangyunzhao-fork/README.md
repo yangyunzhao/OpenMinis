@@ -3,6 +3,9 @@
 本目录保存 `yangyunzhao/OpenMinis` 个人 Fork 的维护、功能和版本资料。当前个人版本为
 [`0.20-preview-znmlr.1`](版本/0.20-preview-znmlr.1/README.md)。
 
+目录名使用 GitHub 所有者 `yangyunzhao` 加 `-fork` 后缀，明确表示这些内容只属于
+个人派生仓库，并降低与官方上游新增通用目录发生重名的可能。
+
 ## 文档分类
 
 | 分类 | 适用范围 | 入口 |
@@ -15,8 +18,13 @@ Windows 上游同步工具位于
 [`仓库维护/Sync-Upstream.ps1`](仓库维护/Sync-Upstream.ps1)。从仓库根目录运行：
 
 ```powershell
-.\znmlr\仓库维护\Sync-Upstream.ps1
+.\yangyunzhao-fork\仓库维护\Sync-Upstream.ps1
 ```
+
+准备个人 Release 前，先阅读
+[发布基线核对说明](仓库维护/发布基线核对说明.md)，并运行
+[`Verify-UpstreamRelease.ps1`](仓库维护/Verify-UpstreamRelease.ps1) 核实官方
+Release、tag、精确提交和源码版本信息。
 
 当前个人 `main` 相对官方上游的动态文件清单见
 [个人派生仓库相对官方上游修改清单](仓库维护/个人派生仓库相对官方上游修改清单.md)。
