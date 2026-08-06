@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ExpectedOrigin = 'https://github.com/yangyunzhao/OpenMinis.git'
 $ExpectedUpstream = 'https://github.com/OpenMinis/OpenMinis.git'
 $MainBranch = 'main'
-$RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 
 function Invoke-Git {
     param(
